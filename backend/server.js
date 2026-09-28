@@ -1,12 +1,14 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const cheerio = require('cheerio');
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
 
 const app = express();
 app.use(cors());
 
+// --- NSE Stock Data Setup (Cookies & Headers) ---
 const jar = new CookieJar();
 const client = wrapper(axios.create({ jar, withCredentials: true }));
 
@@ -16,8 +18,11 @@ const CHROME_HEADERS = {
 };
 
 async function initializeNseSession() {
-    try { await client.get('https://www.nseindia.com', { headers: CHROME_HEADERS }); } 
-    catch (error) { console.log("NSE Cookie fetch delayed, fallback ready."); }
+    try { 
+        await client.get('https://www.nseindia.com', { headers: CHROME_HEADERS }); 
+    } catch (error) { 
+        console.log("NSE Cookie fetch delayed, fallback ready."); 
+    }
 }
 initializeNseSession();
 setInterval(initializeNseSession, 10 * 60 * 1000);
@@ -30,6 +35,7 @@ const POPULAR_NSE_STOCKS = [
     { symbol: "ETERNAL", name: "Eternal Ltd (Formerly Zomato)" } 
 ];
 
+// --- 1. Stock Data API ---
 app.get('/api/stock/:symbol', async (req, res) => {
     const symbol = req.params.symbol.toUpperCase();
     try {
@@ -40,7 +46,6 @@ app.get('/api/stock/:symbol', async (req, res) => {
         const diff = currentPrice - previousClose;
         const sign = diff >= 0 ? "+" : "";
 
-        // Robust fallbacks for financial ratios so N/A never breaks production UI
         const marketCapVal = meta.marketCap ? `₹${(meta.marketCap / 1e7).toFixed(2)} Cr` : `₹${(currentPrice * 4500).toFixed(2)} Cr`;
         const peRatioVal = meta.trailingPE ? meta.trailingPE.toFixed(2) : "24.80";
         const pbRatioVal = meta.priceToBook ? meta.priceToBook.toFixed(2) : "3.45";
@@ -60,6 +65,7 @@ app.get('/api/stock/:symbol', async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Data unavailable" }); }
 });
 
+// --- 2. Stock History API ---
 app.get('/api/history/:symbol', async (req, res) => {
     try {
         const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${req.params.symbol.toUpperCase()}.NS?range=1d&interval=5m`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -75,6 +81,7 @@ app.get('/api/history/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
+// --- 3. Stock News API ---
 app.get('/api/news/:symbol', async (req, res) => {
     try {
         const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${req.params.symbol.toUpperCase()}&newsCount=4`, { headers: { 'User-Agent': 'Mozilla/5.0' }});
@@ -82,6 +89,7 @@ app.get('/api/news/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
+// --- 4. Search API ---
 app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase();
     const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
@@ -92,13 +100,61 @@ app.get('/api/search/:query', async (req, res) => {
     } catch (e) { res.json(local); }
 });
 
-app.get('/api/ipos', (req, res) => {
-    res.json([
-        { company: "Veegaland Developers Limited", symbol: "VEEGALAND", openDate: "10-Sep-2026", issuePrice: "₹130 - ₹140", currentGmp: "₹45", expectedListing: "₹185", gainPotential: "32.1%", marketRating: "Subscribe", sector: "Real Estate" },
-        { company: "LCC Projects Limited", symbol: "LCC", openDate: "09-Sep-2026", issuePrice: "₹79 - ₹84", currentGmp: "₹30", expectedListing: "₹114", gainPotential: "35.7%", marketRating: "Subscribe", sector: "Infrastructure" },
-        { company: "Karamtara Engineering Limited", symbol: "KARAMTARA", openDate: "09-Sep-2026", issuePrice: "₹40 - ₹43", currentGmp: "₹12", expectedListing: "₹55", gainPotential: "27.9%", marketRating: "Neutral", sector: "Engineering" },
-        { company: "Rentomojo Limited", symbol: "RENTOMOJO", openDate: "09-Sep-2026", issuePrice: "₹102 - ₹110", currentGmp: "₹8", expectedListing: "₹118", gainPotential: "7.2%", marketRating: "Avoid", sector: "Consumer Services" }
-    ]);
+// --- 5. LIVE SCRAPED IPO GMP API ---
+app.get('/api/ipos', async (req, res) => {
+    try {
+        // Fetching live GMP table
+        const response = await axios.get('https://www.investorgain.com/report/live-ipo-gmp/331/ipo/', {
+            headers: CHROME_HEADERS
+        });
+        
+        const $ = cheerio.load(response.data);
+        const ipos = [];
+
+        // Loop through each row of the main GMP table
+        $('table.table-bordered tbody tr').each((index, element) => {
+            if (index > 15) return; // Limit to the top 15 most recent/upcoming IPOs
+
+            const columns = $(element).find('td');
+            
+            // Extract text from the table columns
+            const companyNameRaw = $(columns[0]).text().trim();
+            const companyName = companyNameRaw.replace(/IPO|SME/g, '').trim(); 
+            const priceBand = $(columns[2]).text().trim();
+            const gmp = $(columns[3]).text().trim();
+            const estListingRaw = $(columns[4]).text().trim();
+            const openDate = $(columns[8]).text().trim();
+
+            // Extract just the percentage for gain potential if available in the text
+            const gainMatch = estListingRaw.match(/\((.*?\%)\)/);
+            const gainPotential = gainMatch ? gainMatch[1] : "N/A";
+            
+            // Extract just the listing price (removing the percentage part)
+            const expectedListing = estListingRaw.split(' ')[0] || "N/A";
+
+            // Only add rows that actually have a company name
+            if (companyName) {
+                ipos.push({
+                    company: companyName,
+                    symbol: companyName.split(' ')[0].toUpperCase(), // Generate a fallback symbol
+                    openDate: openDate || "TBA",
+                    issuePrice: priceBand ? `₹${priceBand}` : "N/A",
+                    currentGmp: gmp ? `₹${gmp}` : "₹0",
+                    expectedListing: expectedListing.includes('₹') ? expectedListing : `₹${expectedListing}`,
+                    gainPotential: gainPotential,
+                    marketRating: parseFloat(gainPotential) > 15 ? "Subscribe" : "Neutral", // Auto-rate based on GMP %
+                    sector: "Market Stated" // Fallback since sector isn't usually in the GMP table
+                });
+            }
+        });
+
+        res.json(ipos);
+    } catch (error) {
+        console.error("Error fetching live GMP data:", error.message);
+        // Fallback to empty array so the React frontend doesn't crash
+        res.json([]);
+    }
 });
 
-app.listen(5000, () => console.log(`Backend Server running on http://localhost:5000`));
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Backend Server running on port ${PORT}`));

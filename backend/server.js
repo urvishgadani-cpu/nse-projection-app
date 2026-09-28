@@ -103,56 +103,63 @@ app.get('/api/search/:query', async (req, res) => {
 // --- 5. LIVE SCRAPED IPO GMP API ---
 app.get('/api/ipos', async (req, res) => {
     try {
-        // Fetching live GMP table
-        const response = await axios.get('https://www.investorgain.com/report/live-ipo-gmp/331/ipo/', {
+        // Switching to IPO Watch, which has fewer Cloudflare blocks for cloud servers
+        const response = await axios.get('https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/', {
             headers: CHROME_HEADERS
         });
         
         const $ = cheerio.load(response.data);
         const ipos = [];
 
-        // Loop through each row of the main GMP table
-        $('table.table-bordered tbody tr').each((index, element) => {
-            if (index > 15) return; // Limit to the top 15 most recent/upcoming IPOs
+        // IPO Watch uses standard figure/table blocks
+        $('figure.wp-block-table table tbody tr').each((index, element) => {
+            if (index === 0 || index > 15) return; // Skip header row and limit to top 15
 
             const columns = $(element).find('td');
-            
-            // Extract text from the table columns
             const companyNameRaw = $(columns[0]).text().trim();
             const companyName = companyNameRaw.replace(/IPO|SME/g, '').trim(); 
-            const priceBand = $(columns[2]).text().trim();
-            const gmp = $(columns[3]).text().trim();
-            const estListingRaw = $(columns[4]).text().trim();
-            const openDate = $(columns[8]).text().trim();
+            const priceBand = $(columns[1]).text().trim();
+            const gmp = $(columns[2]).text().trim();
+            const estListing = $(columns[3]).text().trim();
 
-            // Extract just the percentage for gain potential if available in the text
-            const gainMatch = estListingRaw.match(/\((.*?\%)\)/);
-            const gainPotential = gainMatch ? gainMatch[1] : "N/A";
-            
-            // Extract just the listing price (removing the percentage part)
-            const expectedListing = estListingRaw.split(' ')[0] || "N/A";
-
-            // Only add rows that actually have a company name
             if (companyName) {
                 ipos.push({
                     company: companyName,
-                    symbol: companyName.split(' ')[0].toUpperCase(), // Generate a fallback symbol
-                    openDate: openDate || "TBA",
+                    symbol: companyName.split(' ')[0].toUpperCase().substring(0, 8),
+                    openDate: "Upcoming", // IPO Watch omits dates in the main GMP table
                     issuePrice: priceBand ? `₹${priceBand}` : "N/A",
                     currentGmp: gmp ? `₹${gmp}` : "₹0",
-                    expectedListing: expectedListing.includes('₹') ? expectedListing : `₹${expectedListing}`,
-                    gainPotential: gainPotential,
-                    marketRating: parseFloat(gainPotential) > 15 ? "Subscribe" : "Neutral", // Auto-rate based on GMP %
-                    sector: "Market Stated" // Fallback since sector isn't usually in the GMP table
+                    expectedListing: estListing.includes('₹') ? estListing : `₹${estListing}`,
+                    gainPotential: "Live", // Replaced with static text as this table doesn't have %
+                    marketRating: parseInt(gmp) > 40 ? "Subscribe" : "Neutral",
+                    sector: "Market Data" 
                 });
             }
         });
 
-        res.json(ipos);
+        if(ipos.length > 0) {
+           return res.json(ipos);
+        }
+        
+        throw new Error("Scraper found no rows (possible website layout change)");
+
     } catch (error) {
         console.error("Error fetching live GMP data:", error.message);
-        // Fallback to empty array so the React frontend doesn't crash
-        res.json([]);
+        
+        // CRITICAL FALLBACK: If the scrape fails, send this dummy data so your React UI never goes blank again.
+        res.json([
+            { 
+                company: "Market Data Currently Syncing...", 
+                symbol: "SYNC", 
+                openDate: "TBA", 
+                issuePrice: "₹0 - ₹0", 
+                currentGmp: "₹0", 
+                expectedListing: "₹0", 
+                gainPotential: "N/A", 
+                marketRating: "Neutral", 
+                sector: "System" 
+            }
+        ]);
     }
 });
 

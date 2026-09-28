@@ -103,7 +103,6 @@ app.get('/api/search/:query', async (req, res) => {
 // --- 5. LIVE SCRAPED IPO GMP API ---
 app.get('/api/ipos', async (req, res) => {
     try {
-        // Switching to IPO Watch, which has fewer Cloudflare blocks for cloud servers
         const response = await axios.get('https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/', {
             headers: CHROME_HEADERS
         });
@@ -111,26 +110,31 @@ app.get('/api/ipos', async (req, res) => {
         const $ = cheerio.load(response.data);
         const ipos = [];
 
-        // IPO Watch uses standard figure/table blocks
         $('figure.wp-block-table table tbody tr').each((index, element) => {
-            if (index === 0 || index > 15) return; // Skip header row and limit to top 15
+            if (index === 0 || index > 15) return; 
 
             const columns = $(element).find('td');
             const companyNameRaw = $(columns[0]).text().trim();
             const companyName = companyNameRaw.replace(/IPO|SME/g, '').trim(); 
-            const priceBand = $(columns[1]).text().trim();
-            const gmp = $(columns[2]).text().trim();
-            const estListing = $(columns[3]).text().trim();
+            
+            // FIX: Re-mapped columns to match IPO Watch's actual layout
+            const gmpRaw = $(columns[1]).text().trim();
+            const priceBandRaw = $(columns[3]).text().trim(); 
+            
+            // Clean up values to prevent UI glitches like "₹₹"
+            const gmp = gmpRaw.replace(/[^0-9]/g, '');
+            const cleanPrice = priceBandRaw.replace(/[^0-9-]/g, '');
 
             if (companyName) {
                 ipos.push({
                     company: companyName,
                     symbol: companyName.split(' ')[0].toUpperCase().substring(0, 8),
-                    openDate: "Upcoming", // IPO Watch omits dates in the main GMP table
-                    issuePrice: priceBand ? `₹${priceBand}` : "N/A",
+                    openDate: "Upcoming",
+                    issuePrice: cleanPrice ? `₹${cleanPrice}` : "N/A",
                     currentGmp: gmp ? `₹${gmp}` : "₹0",
-                    expectedListing: estListing.includes('₹') ? estListing : `₹${estListing}`,
-                    gainPotential: "Live", // Replaced with static text as this table doesn't have %
+                    // Safely calculate Expected Listing directly in the backend
+                    expectedListing: `₹${(parseInt(cleanPrice.split('-').pop()) || 0) + (parseInt(gmp) || 0)}`,
+                    gainPotential: "Live", 
                     marketRating: parseInt(gmp) > 40 ? "Subscribe" : "Neutral",
                     sector: "Market Data" 
                 });
@@ -145,20 +149,8 @@ app.get('/api/ipos', async (req, res) => {
 
     } catch (error) {
         console.error("Error fetching live GMP data:", error.message);
-        
-        // CRITICAL FALLBACK: If the scrape fails, send this dummy data so your React UI never goes blank again.
         res.json([
-            { 
-                company: "Market Data Currently Syncing...", 
-                symbol: "SYNC", 
-                openDate: "TBA", 
-                issuePrice: "₹0 - ₹0", 
-                currentGmp: "₹0", 
-                expectedListing: "₹0", 
-                gainPotential: "N/A", 
-                marketRating: "Neutral", 
-                sector: "System" 
-            }
+            { company: "Market Data Currently Syncing...", symbol: "SYNC", openDate: "TBA", issuePrice: "₹0 - ₹0", currentGmp: "₹0", expectedListing: "₹0", gainPotential: "N/A", marketRating: "Neutral", sector: "System" }
         ]);
     }
 });

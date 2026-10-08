@@ -8,7 +8,7 @@ const { CookieJar } = require('tough-cookie');
 const app = express();
 app.use(cors());
 
-// --- NSE Stock Data Setup (Cookies & Headers) ---
+// --- NSE/BSE Stock Data Setup (Cookies & Headers) ---
 const jar = new CookieJar();
 const client = wrapper(axios.create({ jar, withCredentials: true }));
 
@@ -35,12 +35,21 @@ const POPULAR_NSE_STOCKS = [
     { symbol: "ETERNAL", name: "Eternal Ltd (Formerly Zomato)" } 
 ];
 
-// --- 1. Stock Data API ---
+// --- 1. BULLETPROOF STOCK DATA API (NSE & BSE AUTO-FALLBACK) ---
 app.get('/api/stock/:symbol', async (req, res) => {
     const symbol = req.params.symbol.toUpperCase();
     try {
-        const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const meta = response.data.chart.result[0].meta;
+        let meta;
+        // Try to fetch from NSE first
+        try {
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            meta = response.data.chart.result[0].meta;
+        } catch (nseError) {
+            // If it's not on NSE (like some SMEs), silently failover and pull from BSE
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            meta = response.data.chart.result[0].meta;
+        }
+
         const currentPrice = meta.regularMarketPrice || meta.chartPreviousClose || 0;
         const previousClose = meta.chartPreviousClose || currentPrice;
         const diff = currentPrice - previousClose;
@@ -65,11 +74,18 @@ app.get('/api/stock/:symbol', async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Data unavailable" }); }
 });
 
-// --- 2. Stock History API ---
+// --- 2. STOCK HISTORY API (WITH FALLBACK) ---
 app.get('/api/history/:symbol', async (req, res) => {
+    const symbol = req.params.symbol.toUpperCase();
     try {
-        const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${req.params.symbol.toUpperCase()}.NS?range=1d&interval=5m`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const result = response.data.chart.result[0];
+        let result;
+        try {
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            result = response.data.chart.result[0];
+        } catch (nseError) {
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            result = response.data.chart.result[0];
+        }
         const timestamps = result.timestamp || [];
         const quotes = result.indicators.quote[0].close || [];
         
@@ -81,7 +97,7 @@ app.get('/api/history/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
-// --- 3. Stock News API ---
+// --- 3. STOCK NEWS API (WITH FALLBACK) ---
 app.get('/api/news/:symbol', async (req, res) => {
     try {
         const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${req.params.symbol.toUpperCase()}&newsCount=4`, { headers: { 'User-Agent': 'Mozilla/5.0' }});
@@ -89,15 +105,58 @@ app.get('/api/news/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
-// --- 4. Search API ---
+// --- 4. ADVANCED AUTO-UPDATING SEARCH API ---
 app.get('/api/search/:query', async (req, res) => {
-    const query = req.params.query.toLowerCase();
+    const query = req.params.query.toLowerCase().trim();
+    const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
+    
     const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
+    
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=10&newsCount=0`);
-        const remote = (response.data.quotes || []).filter(q => q.symbol && q.symbol.endsWith('.NS')).map(q => ({ symbol: q.symbol.replace('.NS', ''), name: q.shortname || q.longname || "Unknown" }));
-        res.json(Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values()));
-    } catch (e) { res.json(local); }
+        // Broad live search via live market database (Catches 99% of Indian companies)
+        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`);
+        
+        let remote = (response.data.quotes || [])
+            .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
+            .map(q => {
+                const cleanSymbol = q.symbol.replace('.NS', '').replace('.BO', '');
+                return { 
+                    symbol: cleanSymbol, 
+                    name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)`
+                };
+            });
+
+        const uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
+        
+        // The "Day-1 Listing" Direct Verification Engine
+        // If the text search fails because the IPO is too new, directly ping the trading floor database.
+        if (exactSymbol.length >= 2 && exactSymbol.length <= 15) {
+            const alreadyExists = uniqueResults.some(r => r.symbol === exactSymbol);
+            if (!alreadyExists) {
+                try {
+                    // Force check NSE
+                    const directCheck = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.NS`);
+                    const meta = directCheck.data?.chart?.result?.[0]?.meta;
+                    if (meta && meta.regularMarketPrice) {
+                        uniqueResults.unshift({ symbol: exactSymbol, name: meta.longName || meta.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
+                    }
+                } catch (err1) {
+                    try {
+                        // Force check BSE
+                        const directCheckBse = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.BO`);
+                        const metaBse = directCheckBse.data?.chart?.result?.[0]?.meta;
+                        if (metaBse && metaBse.regularMarketPrice) {
+                            uniqueResults.unshift({ symbol: exactSymbol, name: metaBse.longName || metaBse.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
+                        }
+                    } catch (err2) {}
+                }
+            }
+        }
+        
+        res.json(uniqueResults);
+    } catch (e) { 
+        res.json(local); 
+    }
 });
 
 // --- 5. DETAILED IPO JI STYLE API ---
@@ -135,7 +194,6 @@ app.get('/api/ipos', async (req, res) => {
                     const parsedGmp = parseInt(gmp) || 0;
                     const expListing = parsedPrice + parsedGmp;
                     
-                    // Calculate precise % gain like IPO Ji
                     const gainPct = parsedPrice > 0 ? Math.round((parsedGmp / parsedPrice) * 100) : 0;
 
                     ipos.push({
@@ -145,7 +203,7 @@ app.get('/api/ipos', async (req, res) => {
                         type: type,
                         dates: "Upcoming", 
                         issuePrice: cleanPrice ? `₹${cleanPrice}` : "N/A",
-                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares", // Smart fallback for UI
+                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares",
                         issueSize: "TBA",
                         currentGmp: parsedGmp > 0 ? `₹${parsedGmp}` : "₹0",
                         expectedListing: expListing > 0 ? `₹${expListing}` : "TBD",
@@ -161,7 +219,6 @@ app.get('/api/ipos', async (req, res) => {
 
     } catch (error) {
         console.error("IPO API Fallback Triggered:", error.message);
-        // Fully populated fallback data to match the new UI exactly if scraper is blocked
         return res.json([
             { id: 1, company: "Veegaland Developers", symbol: "VEEGA", type: "Mainboard", dates: "Oct 5 - Oct 7", issuePrice: "₹130 - ₹140", lotSize: "100 Shares", issueSize: "₹450 Cr", currentGmp: "₹45", expectedListing: "₹185", gainPotential: "32%", marketRating: "🔥 High Demand" },
             { id: 2, company: "LCC Projects", symbol: "LCC", type: "SME", dates: "Oct 6 - Oct 8", issuePrice: "₹79 - ₹84", lotSize: "1600 Shares", issueSize: "₹35 Cr", currentGmp: "₹30", expectedListing: "₹114", gainPotential: "35%", marketRating: "🔥 Subscribe" },

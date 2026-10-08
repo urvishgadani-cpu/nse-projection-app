@@ -8,10 +8,6 @@ const { CookieJar } = require('tough-cookie');
 const app = express();
 app.use(cors());
 
-// --- NSE/BSE Stock Data Setup (Cookies & Headers) ---
-const jar = new CookieJar();
-const client = wrapper(axios.create({ jar, withCredentials: true }));
-
 const CHROME_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -19,15 +15,34 @@ const CHROME_HEADERS = {
     'Connection': 'keep-alive'
 };
 
-async function initializeNseSession() {
-    try { 
-        await client.get('https://www.nseindia.com', { headers: CHROME_HEADERS, timeout: 5000 }); 
-    } catch (error) { 
-        console.log("NSE Cookie fetch delayed, fallback ready."); 
+// --- YAHOO FINANCE CRUMB GENERATOR (BYPASSES 401 FIREWALL) ---
+let yahooCookie = '';
+let yahooCrumb = '';
+
+async function refreshYahooSession() {
+    try {
+        // 1. Visit Yahoo to get a valid browser cookie
+        const res = await axios.get('https://finance.yahoo.com', { headers: CHROME_HEADERS, timeout: 8000 });
+        const setCookieHeaders = res.headers['set-cookie'];
+        if (setCookieHeaders) {
+            yahooCookie = setCookieHeaders.map(c => c.split(';')[0]).join('; ');
+        }
+        
+        // 2. Use the cookie to request the secret Crumb token
+        if (yahooCookie) {
+            const crumbRes = await axios.get('https://query1.finance.yahoo.com/v1/test/getcrumb', { 
+                headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie },
+                timeout: 8000
+            });
+            yahooCrumb = crumbRes.data;
+            console.log("✅ Yahoo Session Active. Crumb acquired.");
+        }
+    } catch (e) {
+        console.log("⚠️ Failed to get Yahoo Crumb. The V8 Fallback Engine will be used.");
     }
 }
-initializeNseSession();
-setInterval(initializeNseSession, 10 * 60 * 1000);
+refreshYahooSession();
+setInterval(refreshYahooSession, 15 * 60 * 1000); // Refresh token every 15 minutes
 
 const POPULAR_NSE_STOCKS = [
     { symbol: "RELIANCE", name: "Reliance Industries Ltd" },
@@ -37,64 +52,78 @@ const POPULAR_NSE_STOCKS = [
     { symbol: "ETERNAL", name: "Eternal Ltd (Formerly Zomato)" } 
 ];
 
-// --- 1. BULLETPROOF STOCK DATA API (ACCURATE LIVE PRICES & REAL RATIOS) ---
+// --- 1. DOUBLE-ENGINE STOCK DATA API ---
 app.get('/api/stock/:symbol', async (req, res) => {
     const symbol = req.params.symbol.toUpperCase();
+    let currentPrice = 0, previousClose = 0, quoteData = null, isFallback = false;
+
     try {
-        let quote;
-        // The new v7/quote API fetches real-time prices and true fundamental data
+        // ENGINE A: Try the Accurate V7 API (Requires Crumb)
+        if (!yahooCrumb) throw new Error("No Crumb");
+        
+        // Query both NSE and BSE simultaneously; Yahoo returns whichever exists
+        const v7Url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.NS,${symbol}.BO&crumb=${yahooCrumb}`;
+        const v7Res = await axios.get(v7Url, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie }, timeout: 5000 });
+        
+        if (v7Res.data.quoteResponse.result.length > 0) {
+            quoteData = v7Res.data.quoteResponse.result[0];
+            currentPrice = quoteData.regularMarketPrice || 0;
+            previousClose = quoteData.regularMarketPreviousClose || currentPrice;
+        } else {
+            throw new Error("No data in v7");
+        }
+    } catch (e) {
+        // ENGINE B: Instantly fallback to V8 API if V7 is blocked (Never crashes)
+        isFallback = true;
         try {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.NS`, { headers: CHROME_HEADERS });
-            if (response.data.quoteResponse.result.length > 0) {
-                quote = response.data.quoteResponse.result[0];
-            } else {
-                throw new Error("Not on NSE");
-            }
-        } catch (nseError) {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.BO`, { headers: CHROME_HEADERS });
-            if (response.data.quoteResponse.result.length > 0) {
-                quote = response.data.quoteResponse.result[0];
-            } else {
-                throw new Error("Not on BSE");
+            const v8Res = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: CHROME_HEADERS, timeout: 5000 });
+            quoteData = v8Res.data.chart.result[0].meta;
+            currentPrice = quoteData.regularMarketPrice || 0;
+            previousClose = quoteData.chartPreviousClose || currentPrice;
+        } catch (e2) {
+            try {
+                // Final attempt on BSE
+                const v8ResBse = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`, { headers: CHROME_HEADERS, timeout: 5000 });
+                quoteData = v8ResBse.data.chart.result[0].meta;
+                currentPrice = quoteData.regularMarketPrice || 0;
+                previousClose = quoteData.chartPreviousClose || currentPrice;
+            } catch (e3) {
+                return res.status(500).json({ error: "Data entirely unavailable" });
             }
         }
-
-        const currentPrice = quote.regularMarketPrice || quote.regularMarketPreviousClose || 0;
-        const previousClose = quote.regularMarketPreviousClose || currentPrice;
-        const diff = currentPrice - previousClose;
-        const sign = diff >= 0 ? "+" : "";
-
-        // Safely converts raw Market Cap to Crores (1 Crore = 10,000,000)
-        const marketCapVal = quote.marketCap ? `₹${(quote.marketCap / 10000000).toFixed(2)} Cr` : "N/A";
-        const peRatioVal = quote.trailingPE ? quote.trailingPE.toFixed(2) : (quote.forwardPE ? quote.forwardPE.toFixed(2) : "N/A");
-        const pbRatioVal = quote.priceToBook ? quote.priceToBook.toFixed(2) : "N/A";
-        // Dividend Yield comes back as a raw decimal (e.g., 0.012 for 1.2%)
-        const divYieldVal = quote.dividendYield ? (quote.dividendYield).toFixed(2) + "%" : "0.00%";
-
-        return res.json({
-            symbol: symbol, 
-            name: quote.longName || quote.shortName || symbol, 
-            price: currentPrice.toFixed(2),
-            changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`, 
-            change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
-            previousClose: previousClose.toFixed(2), 
-            dayHigh: quote.regularMarketDayHigh ? quote.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
-            dayLow: quote.regularMarketDayLow ? quote.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2), 
-            volume: quote.regularMarketVolume ? quote.regularMarketVolume.toLocaleString('en-IN') : "N/A",
-            ratios: {
-                marketCap: marketCapVal, 
-                peRatio: peRatioVal, 
-                pbRatio: pbRatioVal,
-                divYield: divYieldVal, 
-                fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh ? `₹${quote.fiftyTwoWeekHigh.toFixed(2)}` : "N/A", 
-                fiftyTwoWeekLow: quote.fiftyTwoWeekLow ? `₹${quote.fiftyTwoWeekLow.toFixed(2)}` : "N/A"
-            }, 
-            status: "LIVE MARKET DATA"
-        });
-    } catch (error) { 
-        console.error("Data Fetch Error:", error.message);
-        res.status(500).json({ error: "Data unavailable" }); 
     }
+
+    // Process the exact numbers for the frontend
+    const diff = currentPrice - previousClose;
+    const sign = diff >= 0 ? "+" : "";
+    
+    let marketCapVal = "N/A", peRatioVal = "N/A", pbRatioVal = "N/A", divYieldVal = "0.00%", high52 = "N/A", low52 = "N/A";
+
+    if (!isFallback && quoteData) {
+        marketCapVal = quoteData.marketCap ? `₹${(quoteData.marketCap / 10000000).toFixed(2)} Cr` : "N/A";
+        peRatioVal = quoteData.trailingPE ? quoteData.trailingPE.toFixed(2) : (quoteData.forwardPE ? quoteData.forwardPE.toFixed(2) : "N/A");
+        pbRatioVal = quoteData.priceToBook ? quoteData.priceToBook.toFixed(2) : "N/A";
+        divYieldVal = quoteData.dividendYield ? (quoteData.dividendYield).toFixed(2) + "%" : "0.00%";
+        high52 = quoteData.fiftyTwoWeekHigh ? `₹${quoteData.fiftyTwoWeekHigh.toFixed(2)}` : "N/A";
+        low52 = quoteData.fiftyTwoWeekLow ? `₹${quoteData.fiftyTwoWeekLow.toFixed(2)}` : "N/A";
+    }
+
+    return res.json({
+        symbol: symbol, 
+        name: quoteData.longName || quoteData.shortName || symbol, 
+        price: currentPrice.toFixed(2),
+        changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`, 
+        change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
+        previousClose: previousClose.toFixed(2), 
+        dayHigh: quoteData.regularMarketDayHigh ? quoteData.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
+        dayLow: quoteData.regularMarketDayLow ? quoteData.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2), 
+        volume: quoteData.regularMarketVolume ? quoteData.regularMarketVolume.toLocaleString('en-IN') : "N/A",
+        ratios: {
+            marketCap: marketCapVal, peRatio: peRatioVal, pbRatio: pbRatioVal,
+            divYield: divYieldVal, fiftyTwoWeekHigh: high52, fiftyTwoWeekLow: low52
+        }, 
+        status: isFallback ? "LIVE PRICES (RATIOS LIMITED)" : "LIVE MARKET DATA"
+    });
 });
 
 // --- 2. STOCK HISTORY API (INTRADAY GRAPH) ---
@@ -136,18 +165,13 @@ app.get('/api/search/:query', async (req, res) => {
     const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
     
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`, { 
-            headers: CHROME_HEADERS 
-        });
+        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`, { headers: CHROME_HEADERS });
         
         let remote = (response.data.quotes || [])
             .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
             .map(q => {
                 const cleanSymbol = q.symbol.replace('.NS', '').replace('.BO', '');
-                return { 
-                    symbol: cleanSymbol, 
-                    name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)`
-                };
+                return { symbol: cleanSymbol, name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)` };
             });
 
         let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
@@ -169,15 +193,7 @@ app.get('/api/search/:query', async (req, res) => {
                     if (meta && meta.regularMarketPrice) {
                         uniqueResults.unshift({ symbol: exactSymbol, name: meta.longName || meta.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
                     }
-                } catch (err1) {
-                    try {
-                        const directCheckBse = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.BO`, { headers: CHROME_HEADERS });
-                        const metaBse = directCheckBse.data?.chart?.result?.[0]?.meta;
-                        if (metaBse && metaBse.regularMarketPrice) {
-                            uniqueResults.unshift({ symbol: exactSymbol, name: metaBse.longName || metaBse.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
-                        }
-                    } catch (err2) {}
-                }
+                } catch (err1) {}
             }
         }
         
@@ -221,22 +237,15 @@ app.get('/api/ipos', async (req, res) => {
                     const parsedPrice = parseInt(priceToUse) || 0;
                     const parsedGmp = parseInt(gmp) || 0;
                     const expListing = parsedPrice + parsedGmp;
-                    
                     const gainPct = parsedPrice > 0 ? Math.round((parsedGmp / parsedPrice) * 100) : 0;
 
                     ipos.push({
-                        id: index,
-                        company: companyName,
-                        symbol: companyName.substring(0, 8).toUpperCase(),
-                        type: type,
-                        dates: "Upcoming", 
-                        issuePrice: cleanPrice ? `₹${cleanPrice}` : "N/A",
-                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares",
-                        issueSize: "TBA",
+                        id: index, company: companyName, symbol: companyName.substring(0, 8).toUpperCase(),
+                        type: type, dates: "Upcoming", issuePrice: cleanPrice ? `₹${cleanPrice}` : "N/A",
+                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares", issueSize: "TBA",
                         currentGmp: parsedGmp > 0 ? `₹${parsedGmp}` : "₹0",
                         expectedListing: expListing > 0 ? `₹${expListing}` : "TBD",
-                        gainPotential: `${gainPct}%`, 
-                        marketRating: parsedGmp > 30 ? "🔥 Subscribe" : "Neutral"
+                        gainPotential: `${gainPct}%`, marketRating: parsedGmp > 30 ? "🔥 Subscribe" : "Neutral"
                     });
                 }
             } catch (rowError) { }

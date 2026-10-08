@@ -2,13 +2,9 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const cheerio = require('cheerio');
-const yahooFinance = require('yahoo-finance2').default;
 
 const app = express();
 app.use(cors());
-
-// Suppress unneeded package warnings
-yahooFinance.suppressNotices(['yahooSurvey']);
 
 const POPULAR_NSE_STOCKS = [
     { symbol: "RELIANCE", name: "Reliance Industries Ltd" },
@@ -18,48 +14,93 @@ const POPULAR_NSE_STOCKS = [
     { symbol: "ZOMATO", name: "Zomato Limited" } 
 ];
 
-// --- 1. PINPOINT ACCURATE STOCK DATA API (via yahoo-finance2) ---
+// --- THE PROXY TUNNEL ENGINE (BYPASSES RENDER IP BANS) ---
+// This forces requests through open-source proxy servers. Yahoo Finance sees 
+// the proxy's IP address instead of Render's blocked cloud IP, granting full access.
+async function fetchWithProxy(targetUrl) {
+    try {
+        // Proxy 1: AllOrigins Network
+        const proxy1 = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+        const res1 = await axios.get(proxy1, { timeout: 8000 });
+        return res1.data;
+    } catch (e1) {
+        try {
+            // Proxy 2: Fallback to CorsProxy if Proxy 1 is busy
+            const proxy2 = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+            const res2 = await axios.get(proxy2, { timeout: 8000 });
+            return res2.data;
+        } catch (e2) {
+            // Proxy 3: Direct attempt as absolute last resort
+            const res3 = await axios.get(targetUrl, { timeout: 5000 });
+            return res3.data;
+        }
+    }
+}
+
+// --- 1. PINPOINT ACCURATE STOCK DATA API ---
 app.get('/api/stock/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
-    if (symbol === 'ETERNAL') symbol = 'ZOMATO'; // Safely map custom ticker
+    if (symbol === 'ETERNAL') symbol = 'ZOMATO'; 
 
     try {
-        let quote;
-        // 1. Automatically fetch the live quote, evading IP blocks
+        // 1. Fetch Live Prices via Proxy Tunnel
+        let chartData;
         try {
-            quote = await yahooFinance.quote(`${symbol}.NS`);
-        } catch (nseErr) {
-            quote = await yahooFinance.quote(`${symbol}.BO`);
+            const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`;
+            const rawChart = await fetchWithProxy(chartUrl);
+            chartData = rawChart.chart.result[0].meta;
+        } catch (e) {
+            const bseUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`;
+            const rawBse = await fetchWithProxy(bseUrl);
+            chartData = rawBse.chart.result[0].meta;
         }
 
-        const currentPrice = quote.regularMarketPrice || quote.regularMarketPreviousClose || 0;
-        const previousClose = quote.regularMarketPreviousClose || currentPrice;
+        // 2. Fetch Exact Fundamentals via Proxy Tunnel
+        let pe = "N/A", pb = "N/A", div = "0.00%", mcap = "N/A", high52 = "N/A", low52 = "N/A";
+        try {
+            const summaryUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}.NS?modules=summaryDetail,defaultKeyStatistics`;
+            const sumRes = await fetchWithProxy(summaryUrl);
+            
+            if (sumRes && sumRes.quoteSummary && sumRes.quoteSummary.result) {
+                const sum = sumRes.quoteSummary.result[0].summaryDetail || {};
+                const stats = sumRes.quoteSummary.result[0].defaultKeyStatistics || {};
+                
+                pe = sum.trailingPE?.raw ? sum.trailingPE.raw.toFixed(2) : "N/A";
+                pb = stats.priceToBook?.raw ? stats.priceToBook.raw.toFixed(2) : "N/A";
+                div = sum.dividendYield?.raw ? (sum.dividendYield.raw * 100).toFixed(2) + "%" : "0.00%";
+                mcap = sum.marketCap?.raw ? `₹${(sum.marketCap.raw / 10000000).toFixed(2)} Cr` : "N/A";
+                high52 = sum.fiftyTwoWeekHigh?.raw ? `₹${sum.fiftyTwoWeekHigh.raw.toFixed(2)}` : "N/A";
+                low52 = sum.fiftyTwoWeekLow?.raw ? `₹${sum.fiftyTwoWeekLow.raw.toFixed(2)}` : "N/A";
+            }
+        } catch (fundErr) {
+            console.log("Fundamentals delayed, attempting fallback.");
+        }
+
+        const currentPrice = chartData.regularMarketPrice || chartData.chartPreviousClose || 0;
+        const previousClose = chartData.chartPreviousClose || currentPrice;
         const diff = currentPrice - previousClose;
         const sign = diff >= 0 ? "+" : "";
 
-        // 2. Extract true fundamentals seamlessly
-        const mcap = quote.marketCap ? `₹${(quote.marketCap / 10000000).toFixed(2)} Cr` : "N/A";
-        const pe = quote.trailingPE ? quote.trailingPE.toFixed(2) : (quote.forwardPE ? quote.forwardPE.toFixed(2) : "N/A");
-        const pb = quote.priceToBook ? quote.priceToBook.toFixed(2) : "N/A";
-        const divYield = quote.trailingAnnualDividendYield ? (quote.trailingAnnualDividendYield * 100).toFixed(2) + "%" : "0.00%";
-        const high52 = quote.fiftyTwoWeekHigh ? `₹${quote.fiftyTwoWeekHigh.toFixed(2)}` : "N/A";
-        const low52 = quote.fiftyTwoWeekLow ? `₹${quote.fiftyTwoWeekLow.toFixed(2)}` : "N/A";
+        // Secondary Market Cap math fallback just in case
+        if (mcap === "N/A" && chartData.marketCap) {
+            mcap = `₹${(chartData.marketCap / 10000000).toFixed(2)} Cr`;
+        }
 
         return res.json({
             symbol: req.params.symbol.toUpperCase(),
-            name: quote.longName || quote.shortName || symbol,
+            name: chartData.longName || chartData.shortName || symbol,
             price: currentPrice.toFixed(2),
             changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`,
             change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
             previousClose: previousClose.toFixed(2),
-            dayHigh: quote.regularMarketDayHigh ? quote.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
-            dayLow: quote.regularMarketDayLow ? quote.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2),
-            volume: quote.regularMarketVolume ? quote.regularMarketVolume.toLocaleString('en-IN') : "N/A",
+            dayHigh: chartData.regularMarketDayHigh ? chartData.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
+            dayLow: chartData.regularMarketDayLow ? chartData.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2),
+            volume: chartData.regularMarketVolume ? chartData.regularMarketVolume.toLocaleString('en-IN') : "N/A",
             ratios: {
-                marketCap: mcap, peRatio: pe, pbRatio: pb, divYield: divYield,
+                marketCap: mcap, peRatio: pe, pbRatio: pb, divYield: div,
                 fiftyTwoWeekHigh: high52, fiftyTwoWeekLow: low52
             },
-            status: "LIVE MARKET DATA"
+            status: "LIVE DATA (PROXY TUNNEL)"
         });
 
     } catch (error) {
@@ -71,66 +112,58 @@ app.get('/api/stock/:symbol', async (req, res) => {
     }
 });
 
-// --- 2. STOCK HISTORY API (INTRADAY GRAPH) ---
+// --- 2. STOCK HISTORY API (PROXY TUNNEL) ---
 app.get('/api/history/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
 
     try {
-        // Fetch last 3 days to guarantee intraday data even right after weekends
-        const queryOptions = { period1: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000), interval: '5m' }; 
-        let chart;
-        try {
-            chart = await yahooFinance.chart(`${symbol}.NS`, queryOptions);
-        } catch (err) {
-            chart = await yahooFinance.chart(`${symbol}.BO`, queryOptions);
-        }
-
-        const history = (chart.quotes || []).map(q => ({
-            time: new Date(q.date).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-            price: q.close ? parseFloat(q.close.toFixed(2)) : null
-        })).filter(item => item.price !== null);
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`;
+        const rawChart = await fetchWithProxy(url);
+        const result = rawChart.chart.result[0];
         
-        // Return only the most recent day's worth of 5-minute ticks (~75 ticks per trading day)
-        res.json(history.slice(-75));
-    } catch (err) { 
-        res.json([]); 
-    }
+        const timestamps = result.timestamp || [];
+        const quotes = result.indicators.quote[0].close || [];
+        
+        const history = timestamps.map((t, idx) => ({
+            time: new Date(t * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
+            price: quotes[idx] ? parseFloat(quotes[idx].toFixed(2)) : null
+        })).filter(item => item.price !== null);
+        res.json(history);
+    } catch (err) { res.json([]); }
 });
 
-// --- 3. STOCK NEWS API ---
+// --- 3. STOCK NEWS API (PROXY TUNNEL) ---
 app.get('/api/news/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
-    
     try {
-        const news = await yahooFinance.search(symbol, { newsCount: 4, quotesCount: 0 });
-        res.json((news.news || []).map(n => ({ 
-            title: n.title, 
-            publisher: n.publisher, 
-            link: n.link, 
-            time: new Date(n.providerPublishTime).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) 
+        const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=4`;
+        const searchData = await fetchWithProxy(url);
+        res.json((searchData.news || []).map(n => ({ 
+            title: n.title, publisher: n.publisher, link: n.link, 
+            time: new Date(n.providerPublishTime * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) 
         })));
     } catch (err) { res.json([]); }
 });
 
-// --- 4. ADVANCED AUTO-UPDATING SEARCH API ---
+// --- 4. ADVANCED AUTO-UPDATING SEARCH API (PROXY TUNNEL) ---
 app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase().trim();
-    const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
+    
+    const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
     
     try {
-        const searchResults = await yahooFinance.search(query, { quotesCount: 30, newsCount: 0 });
+        const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`;
+        const searchData = await fetchWithProxy(url);
         
-        let remote = (searchResults.quotes || [])
+        let remote = (searchData.quotes || [])
             .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
             .map(q => {
                 const cleanSymbol = q.symbol.replace('.NS', '').replace('.BO', '');
                 return { symbol: cleanSymbol, name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)` };
             });
 
-        // Mix in popular local stocks for instant matching
-        const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
         let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
         
         uniqueResults.sort((a, b) => {
@@ -140,23 +173,10 @@ app.get('/api/search/:query', async (req, res) => {
             if (!aStarts && bStarts) return 1;
             return 0;
         });
-
-        // Day-1 Listing Verification 
-        if (exactSymbol.length >= 2 && exactSymbol.length <= 15) {
-            const alreadyExists = uniqueResults.some(r => r.symbol === exactSymbol);
-            if (!alreadyExists) {
-                try {
-                    const quote = await yahooFinance.quote(`${exactSymbol}.NS`);
-                    if (quote && quote.regularMarketPrice) {
-                        uniqueResults.unshift({ symbol: exactSymbol, name: quote.longName || quote.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
-                    }
-                } catch (err1) {}
-            }
-        }
         
         res.json(uniqueResults);
     } catch (e) { 
-        res.json([]); 
+        res.json(local); 
     }
 });
 
@@ -164,10 +184,7 @@ app.get('/api/search/:query', async (req, res) => {
 app.get('/api/ipos', async (req, res) => {
     try {
         const response = await axios.get('https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/', {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml'
-            },
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
             timeout: 8000
         });
         

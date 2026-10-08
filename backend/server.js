@@ -6,101 +6,128 @@ const cheerio = require('cheerio');
 const app = express();
 app.use(cors());
 
-// Lightweight headers to mimic a standard browser request without triggering strict bot-protection
+// Lightweight headers to mimic a normal human Chrome browser
 const CHROME_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9'
 };
 
-const POPULAR_NSE_STOCKS = [
-    { symbol: "RELIANCE", name: "Reliance Industries Ltd" },
-    { symbol: "TCS", name: "Tata Consultancy Services" },
-    { symbol: "INFY", name: "Infosys Limited" },
-    { symbol: "HDFCBANK", name: "HDFC Bank Limited" },
-    { symbol: "ETERNAL", name: "Eternal Ltd (Formerly Zomato)" } 
-];
+// --- THE YAHOO COOKIE/CRUMB BYPASS ENGINE ---
+let yahooCookie = '';
+let yahooCrumb = '';
 
-// --- 1. PINPOINT ACCURATE STOCK DATA API (v10 quoteSummary) ---
-app.get('/api/stock/:symbol', async (req, res) => {
-    const symbol = req.params.symbol.toUpperCase();
+async function refreshYahooSession() {
     try {
-        let result;
+        console.log("🔄 Generating new Yahoo Security Session...");
         
-        // Use the highly accurate v10 quoteSummary API (Bypasses the firewall)
-        try {
-            const nseUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}.NS?modules=price,summaryDetail,defaultKeyStatistics`;
-            const response = await axios.get(nseUrl, { headers: CHROME_HEADERS, timeout: 8000 });
-            if (response.data.quoteSummary.result) {
-                result = response.data.quoteSummary.result[0];
-            } else throw new Error("Not on NSE");
-        } catch (nseError) {
-            const bseUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}.BO?modules=price,summaryDetail,defaultKeyStatistics`;
-            const response = await axios.get(bseUrl, { headers: CHROME_HEADERS, timeout: 8000 });
-            if (response.data.quoteSummary.result) {
-                result = response.data.quoteSummary.result[0];
-            } else throw new Error("Not on BSE");
+        // 1. Hit the hidden fc.yahoo.com endpoint to force generation of the 'B' cookie
+        const cookieRes = await axios.get('https://fc.yahoo.com', {
+            headers: CHROME_HEADERS,
+            validateStatus: () => true, // It returns 404, but we only need the headers
+            timeout: 8000
+        });
+
+        const cookies = cookieRes.headers['set-cookie'];
+        if (cookies) {
+            yahooCookie = cookies.find(c => c.startsWith('B='))?.split(';')[0] || '';
         }
 
-        // Extract the exact modules
-        const priceData = result.price || {};
-        const summary = result.summaryDetail || {};
-        const stats = result.defaultKeyStatistics || {};
+        // 2. Use the 'B' cookie to request the security Crumb
+        if (yahooCookie) {
+            const crumbRes = await axios.get('https://query1.finance.yahoo.com/v1/test/getcrumb', {
+                headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie },
+                timeout: 8000
+            });
+            yahooCrumb = crumbRes.data;
+            console.log("✅ Firewall Bypassed. Live Data Unlocked.");
+        }
+    } catch (e) {
+        console.error("⚠️ Session bypass failed. Will retry.", e.message);
+    }
+}
 
-        // Pinpoint live prices
-        const currentPrice = priceData.regularMarketPrice?.raw || 0;
-        const previousClose = priceData.regularMarketPreviousClose?.raw || currentPrice;
+// Start the bypass engine immediately and refresh every 15 mins
+refreshYahooSession();
+setInterval(refreshYahooSession, 15 * 60 * 1000);
+
+// --- 1. PINPOINT ACCURATE STOCK DATA API (v7 quote + Crumb) ---
+app.get('/api/stock/:symbol', async (req, res) => {
+    let symbol = req.params.symbol.toUpperCase();
+    
+    // Safety Catch: ETERNAL does not exist on NSE. It trades as ZOMATO.
+    // This prevents the backend from crashing when the homepage loads.
+    if (symbol === 'ETERNAL') symbol = 'ZOMATO';
+
+    try {
+        // If the server restarted and hasn't gotten the crumb yet, wait for it
+        if (!yahooCrumb || !yahooCookie) await refreshYahooSession();
+
+        const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.NS,${symbol}.BO&crumb=${yahooCrumb}`;
+        const response = await axios.get(url, {
+            headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie },
+            timeout: 8000
+        });
+
+        const resultArr = response.data?.quoteResponse?.result;
+        if (!resultArr || resultArr.length === 0) throw new Error("Symbol not found on exchange");
+
+        const quote = resultArr[0];
+
+        const currentPrice = quote.regularMarketPrice || quote.regularMarketPreviousClose || 0;
+        const previousClose = quote.regularMarketPreviousClose || currentPrice;
         const diff = currentPrice - previousClose;
         const sign = diff >= 0 ? "+" : "";
 
-        // Exact Fundamentals
-        const mcapRaw = summary.marketCap?.raw || priceData.marketCap?.raw;
-        const marketCapVal = mcapRaw ? `₹${(mcapRaw / 10000000).toFixed(2)} Cr` : "N/A";
-        
-        const peRaw = summary.trailingPE?.raw || summary.forwardPE?.raw;
-        const peRatioVal = peRaw ? peRaw.toFixed(2) : "N/A";
-
-        const pbRaw = stats.priceToBook?.raw || summary.priceToBook?.raw;
-        const pbRatioVal = pbRaw ? pbRaw.toFixed(2) : "N/A";
-
-        const divRaw = summary.dividendYield?.raw;
-        const divYieldVal = divRaw ? (divRaw * 100).toFixed(2) + "%" : "0.00%";
-
-        const high52 = summary.fiftyTwoWeekHigh?.raw ? `₹${summary.fiftyTwoWeekHigh.raw.toFixed(2)}` : "N/A";
-        const low52 = summary.fiftyTwoWeekLow?.raw ? `₹${summary.fiftyTwoWeekLow.raw.toFixed(2)}` : "N/A";
+        const mcap = quote.marketCap ? `₹${(quote.marketCap / 10000000).toFixed(2)} Cr` : "N/A";
+        const pe = quote.trailingPE ? quote.trailingPE.toFixed(2) : (quote.forwardPE ? quote.forwardPE.toFixed(2) : "N/A");
+        const pb = quote.priceToBook ? quote.priceToBook.toFixed(2) : "N/A";
+        const div = quote.dividendYield ? (quote.dividendYield).toFixed(2) + "%" : "0.00%";
+        const high52 = quote.fiftyTwoWeekHigh ? `₹${quote.fiftyTwoWeekHigh.toFixed(2)}` : "N/A";
+        const low52 = quote.fiftyTwoWeekLow ? `₹${quote.fiftyTwoWeekLow.toFixed(2)}` : "N/A";
 
         return res.json({
-            symbol: symbol, 
-            name: priceData.longName || priceData.shortName || symbol, 
+            symbol: req.params.symbol.toUpperCase(), // Returns requested name so UI matches it
+            name: quote.longName || quote.shortName || symbol,
             price: currentPrice.toFixed(2),
-            changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`, 
+            changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`,
             change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
-            previousClose: previousClose.toFixed(2), 
-            dayHigh: priceData.regularMarketDayHigh?.raw ? priceData.regularMarketDayHigh.raw.toFixed(2) : currentPrice.toFixed(2),
-            dayLow: priceData.regularMarketDayLow?.raw ? priceData.regularMarketDayLow.raw.toFixed(2) : currentPrice.toFixed(2), 
-            volume: priceData.regularMarketVolume?.raw ? priceData.regularMarketVolume.raw.toLocaleString('en-IN') : "N/A",
+            previousClose: previousClose.toFixed(2),
+            dayHigh: quote.regularMarketDayHigh ? quote.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
+            dayLow: quote.regularMarketDayLow ? quote.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2),
+            volume: quote.regularMarketVolume ? quote.regularMarketVolume.toLocaleString('en-IN') : "N/A",
             ratios: {
-                marketCap: marketCapVal, peRatio: peRatioVal, pbRatio: pbRatioVal,
-                divYield: divYieldVal, fiftyTwoWeekHigh: high52, fiftyTwoWeekLow: low52
-            }, 
+                marketCap: mcap, peRatio: pe, pbRatio: pb, divYield: div,
+                fiftyTwoWeekHigh: high52, fiftyTwoWeekLow: low52
+            },
             status: "LIVE MARKET DATA"
         });
-    } catch (error) { 
+
+    } catch (error) {
         console.error(`Error fetching ${symbol}:`, error.message);
-        res.status(500).json({ error: "Data unavailable" }); 
+        // CRITICAL FIX: Instead of throwing a 500 error that freezes the UI on "...", 
+        // we return a safe N/A fallback so the rest of the app continues working flawlessly.
+        return res.json({
+            symbol: req.params.symbol.toUpperCase(), name: symbol, price: "N/A", 
+            changeAmount: "N/A", change: "N/A", previousClose: "N/A", status: "FETCH FAILED"
+        });
     }
 });
 
 // --- 2. STOCK HISTORY API (INTRADAY GRAPH) ---
 app.get('/api/history/:symbol', async (req, res) => {
-    const symbol = req.params.symbol.toUpperCase();
+    let symbol = req.params.symbol.toUpperCase();
+    if (symbol === 'ETERNAL') symbol = 'ZOMATO';
+
     try {
         let result;
         try {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`, { headers: CHROME_HEADERS });
+            const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`;
+            const response = await axios.get(url, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie }, timeout: 8000 });
             result = response.data.chart.result[0];
         } catch (nseError) {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`, { headers: CHROME_HEADERS });
+            const urlBse = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`;
+            const response = await axios.get(urlBse, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie }, timeout: 8000 });
             result = response.data.chart.result[0];
         }
         const timestamps = result.timestamp || [];
@@ -116,8 +143,10 @@ app.get('/api/history/:symbol', async (req, res) => {
 
 // --- 3. STOCK NEWS API ---
 app.get('/api/news/:symbol', async (req, res) => {
+    let symbol = req.params.symbol.toUpperCase();
+    if (symbol === 'ETERNAL') symbol = 'ZOMATO';
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${req.params.symbol.toUpperCase()}&newsCount=4`, { headers: CHROME_HEADERS });
+        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=4`, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie } });
         res.json((response.data.news || []).map(n => ({ title: n.title, publisher: n.publisher, link: n.link, time: new Date(n.providerPublishTime * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) })));
     } catch (err) { res.json([]); }
 });
@@ -127,10 +156,10 @@ app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase().trim();
     const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
     
-    const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
-    
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`, { headers: CHROME_HEADERS });
+        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`, { 
+            headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie } 
+        });
         
         let remote = (response.data.quotes || [])
             .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
@@ -139,7 +168,7 @@ app.get('/api/search/:query', async (req, res) => {
                 return { symbol: cleanSymbol, name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)` };
             });
 
-        let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
+        let uniqueResults = Array.from(new Map(remote.map(item => [item.symbol, item])).values());
         
         uniqueResults.sort((a, b) => {
             const aStarts = a.symbol.toLowerCase().startsWith(query);
@@ -149,22 +178,9 @@ app.get('/api/search/:query', async (req, res) => {
             return 0;
         });
         
-        if (exactSymbol.length >= 2 && exactSymbol.length <= 15) {
-            const alreadyExists = uniqueResults.some(r => r.symbol === exactSymbol);
-            if (!alreadyExists) {
-                try {
-                    const directCheck = await axios.get(`https://query2.finance.yahoo.com/v10/finance/quoteSummary/${exactSymbol}.NS?modules=price`, { headers: CHROME_HEADERS });
-                    const meta = directCheck.data?.quoteSummary?.result?.[0]?.price;
-                    if (meta && meta.regularMarketPrice) {
-                        uniqueResults.unshift({ symbol: exactSymbol, name: meta.longName || meta.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
-                    }
-                } catch (err1) {}
-            }
-        }
-        
         res.json(uniqueResults);
     } catch (e) { 
-        res.json(local); 
+        res.json([]); 
     }
 });
 

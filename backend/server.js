@@ -14,7 +14,9 @@ const client = wrapper(axios.create({ jar, withCredentials: true }));
 
 const CHROME_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive'
 };
 
 async function initializeNseSession() {
@@ -41,10 +43,10 @@ app.get('/api/stock/:symbol', async (req, res) => {
     try {
         let meta;
         try {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: CHROME_HEADERS });
             meta = response.data.chart.result[0].meta;
         } catch (nseError) {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`, { headers: CHROME_HEADERS });
             meta = response.data.chart.result[0].meta;
         }
 
@@ -78,10 +80,10 @@ app.get('/api/history/:symbol', async (req, res) => {
     try {
         let result;
         try {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`, { headers: CHROME_HEADERS });
             result = response.data.chart.result[0];
         } catch (nseError) {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`, { headers: CHROME_HEADERS });
             result = response.data.chart.result[0];
         }
         const timestamps = result.timestamp || [];
@@ -98,12 +100,12 @@ app.get('/api/history/:symbol', async (req, res) => {
 // --- 3. STOCK NEWS API ---
 app.get('/api/news/:symbol', async (req, res) => {
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${req.params.symbol.toUpperCase()}&newsCount=4`, { headers: { 'User-Agent': 'Mozilla/5.0' }});
+        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${req.params.symbol.toUpperCase()}&newsCount=4`, { headers: CHROME_HEADERS });
         res.json((response.data.news || []).map(n => ({ title: n.title, publisher: n.publisher, link: n.link, time: new Date(n.providerPublishTime * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) })));
     } catch (err) { res.json([]); }
 });
 
-// --- 4. ADVANCED AUTO-UPDATING SEARCH API (WITH PREFIX SORTING) ---
+// --- 4. ADVANCED AUTO-UPDATING SEARCH API (WITH CHROME HEADERS) ---
 app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase().trim();
     const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
@@ -111,7 +113,9 @@ app.get('/api/search/:query', async (req, res) => {
     const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
     
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`);
+        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`, { 
+            headers: CHROME_HEADERS 
+        });
         
         let remote = (response.data.quotes || [])
             .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
@@ -125,7 +129,6 @@ app.get('/api/search/:query', async (req, res) => {
 
         let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
         
-        // Smart Sort: Force companies that START with the searched letter(s) to the very top
         uniqueResults.sort((a, b) => {
             const aStarts = a.symbol.toLowerCase().startsWith(query);
             const bStarts = b.symbol.toLowerCase().startsWith(query);
@@ -134,19 +137,18 @@ app.get('/api/search/:query', async (req, res) => {
             return 0;
         });
         
-        // Day-1 Listing Direct Verification
         if (exactSymbol.length >= 2 && exactSymbol.length <= 15) {
             const alreadyExists = uniqueResults.some(r => r.symbol === exactSymbol);
             if (!alreadyExists) {
                 try {
-                    const directCheck = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.NS`);
+                    const directCheck = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.NS`, { headers: CHROME_HEADERS });
                     const meta = directCheck.data?.chart?.result?.[0]?.meta;
                     if (meta && meta.regularMarketPrice) {
                         uniqueResults.unshift({ symbol: exactSymbol, name: meta.longName || meta.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
                     }
                 } catch (err1) {
                     try {
-                        const directCheckBse = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.BO`);
+                        const directCheckBse = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.BO`, { headers: CHROME_HEADERS });
                         const metaBse = directCheckBse.data?.chart?.result?.[0]?.meta;
                         if (metaBse && metaBse.regularMarketPrice) {
                             uniqueResults.unshift({ symbol: exactSymbol, name: metaBse.longName || metaBse.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
@@ -158,6 +160,7 @@ app.get('/api/search/:query', async (req, res) => {
         
         res.json(uniqueResults);
     } catch (e) { 
+        console.error("Search Engine Error:", e.message);
         res.json(local); 
     }
 });

@@ -40,12 +40,10 @@ app.get('/api/stock/:symbol', async (req, res) => {
     const symbol = req.params.symbol.toUpperCase();
     try {
         let meta;
-        // Try to fetch from NSE first
         try {
             const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
             meta = response.data.chart.result[0].meta;
         } catch (nseError) {
-            // If it's not on NSE (like some SMEs), silently failover and pull from BSE
             const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
             meta = response.data.chart.result[0].meta;
         }
@@ -97,7 +95,7 @@ app.get('/api/history/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
-// --- 3. STOCK NEWS API (WITH FALLBACK) ---
+// --- 3. STOCK NEWS API ---
 app.get('/api/news/:symbol', async (req, res) => {
     try {
         const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${req.params.symbol.toUpperCase()}&newsCount=4`, { headers: { 'User-Agent': 'Mozilla/5.0' }});
@@ -105,7 +103,7 @@ app.get('/api/news/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
-// --- 4. ADVANCED AUTO-UPDATING SEARCH API ---
+// --- 4. ADVANCED AUTO-UPDATING SEARCH API (WITH PREFIX SORTING) ---
 app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase().trim();
     const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
@@ -113,7 +111,6 @@ app.get('/api/search/:query', async (req, res) => {
     const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
     
     try {
-        // Broad live search via live market database (Catches 99% of Indian companies)
         const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`);
         
         let remote = (response.data.quotes || [])
@@ -126,15 +123,22 @@ app.get('/api/search/:query', async (req, res) => {
                 };
             });
 
-        const uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
+        let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
         
-        // The "Day-1 Listing" Direct Verification Engine
-        // If the text search fails because the IPO is too new, directly ping the trading floor database.
+        // Smart Sort: Force companies that START with the searched letter(s) to the very top
+        uniqueResults.sort((a, b) => {
+            const aStarts = a.symbol.toLowerCase().startsWith(query);
+            const bStarts = b.symbol.toLowerCase().startsWith(query);
+            if (aStarts && !bStarts) return -1;
+            if (!aStarts && bStarts) return 1;
+            return 0;
+        });
+        
+        // Day-1 Listing Direct Verification
         if (exactSymbol.length >= 2 && exactSymbol.length <= 15) {
             const alreadyExists = uniqueResults.some(r => r.symbol === exactSymbol);
             if (!alreadyExists) {
                 try {
-                    // Force check NSE
                     const directCheck = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.NS`);
                     const meta = directCheck.data?.chart?.result?.[0]?.meta;
                     if (meta && meta.regularMarketPrice) {
@@ -142,7 +146,6 @@ app.get('/api/search/:query', async (req, res) => {
                     }
                 } catch (err1) {
                     try {
-                        // Force check BSE
                         const directCheckBse = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${exactSymbol}.BO`);
                         const metaBse = directCheckBse.data?.chart?.result?.[0]?.meta;
                         if (metaBse && metaBse.regularMarketPrice) {
@@ -218,7 +221,6 @@ app.get('/api/ipos', async (req, res) => {
         throw new Error("Scraper returned zero rows.");
 
     } catch (error) {
-        console.error("IPO API Fallback Triggered:", error.message);
         return res.json([
             { id: 1, company: "Veegaland Developers", symbol: "VEEGA", type: "Mainboard", dates: "Oct 5 - Oct 7", issuePrice: "₹130 - ₹140", lotSize: "100 Shares", issueSize: "₹450 Cr", currentGmp: "₹45", expectedListing: "₹185", gainPotential: "32%", marketRating: "🔥 High Demand" },
             { id: 2, company: "LCC Projects", symbol: "LCC", type: "SME", dates: "Oct 6 - Oct 8", issuePrice: "₹79 - ₹84", lotSize: "1600 Shares", issueSize: "₹35 Cr", currentGmp: "₹30", expectedListing: "₹114", gainPotential: "35%", marketRating: "🔥 Subscribe" },

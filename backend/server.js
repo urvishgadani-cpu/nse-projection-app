@@ -2,92 +2,51 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const cheerio = require('cheerio');
+const yahooFinance = require('yahoo-finance2').default;
 
 const app = express();
 app.use(cors());
 
-// Lightweight headers to mimic a normal human Chrome browser
-const CHROME_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9'
-};
+// Suppress unneeded package warnings
+yahooFinance.suppressNotices(['yahooSurvey']);
 
-// --- THE YAHOO COOKIE/CRUMB BYPASS ENGINE ---
-let yahooCookie = '';
-let yahooCrumb = '';
+const POPULAR_NSE_STOCKS = [
+    { symbol: "RELIANCE", name: "Reliance Industries Ltd" },
+    { symbol: "TCS", name: "Tata Consultancy Services" },
+    { symbol: "INFY", name: "Infosys Limited" },
+    { symbol: "HDFCBANK", name: "HDFC Bank Limited" },
+    { symbol: "ZOMATO", name: "Zomato Limited" } 
+];
 
-async function refreshYahooSession() {
-    try {
-        console.log("🔄 Generating new Yahoo Security Session...");
-        
-        // 1. Hit the hidden fc.yahoo.com endpoint to force generation of the 'B' cookie
-        const cookieRes = await axios.get('https://fc.yahoo.com', {
-            headers: CHROME_HEADERS,
-            validateStatus: () => true, // It returns 404, but we only need the headers
-            timeout: 8000
-        });
-
-        const cookies = cookieRes.headers['set-cookie'];
-        if (cookies) {
-            yahooCookie = cookies.find(c => c.startsWith('B='))?.split(';')[0] || '';
-        }
-
-        // 2. Use the 'B' cookie to request the security Crumb
-        if (yahooCookie) {
-            const crumbRes = await axios.get('https://query1.finance.yahoo.com/v1/test/getcrumb', {
-                headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie },
-                timeout: 8000
-            });
-            yahooCrumb = crumbRes.data;
-            console.log("✅ Firewall Bypassed. Live Data Unlocked.");
-        }
-    } catch (e) {
-        console.error("⚠️ Session bypass failed. Will retry.", e.message);
-    }
-}
-
-// Start the bypass engine immediately and refresh every 15 mins
-refreshYahooSession();
-setInterval(refreshYahooSession, 15 * 60 * 1000);
-
-// --- 1. PINPOINT ACCURATE STOCK DATA API (v7 quote + Crumb) ---
+// --- 1. PINPOINT ACCURATE STOCK DATA API (via yahoo-finance2) ---
 app.get('/api/stock/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
-    
-    // Safety Catch: ETERNAL does not exist on NSE. It trades as ZOMATO.
-    // This prevents the backend from crashing when the homepage loads.
-    if (symbol === 'ETERNAL') symbol = 'ZOMATO';
+    if (symbol === 'ETERNAL') symbol = 'ZOMATO'; // Safely map custom ticker
 
     try {
-        // If the server restarted and hasn't gotten the crumb yet, wait for it
-        if (!yahooCrumb || !yahooCookie) await refreshYahooSession();
-
-        const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.NS,${symbol}.BO&crumb=${yahooCrumb}`;
-        const response = await axios.get(url, {
-            headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie },
-            timeout: 8000
-        });
-
-        const resultArr = response.data?.quoteResponse?.result;
-        if (!resultArr || resultArr.length === 0) throw new Error("Symbol not found on exchange");
-
-        const quote = resultArr[0];
+        let quote;
+        // 1. Automatically fetch the live quote, evading IP blocks
+        try {
+            quote = await yahooFinance.quote(`${symbol}.NS`);
+        } catch (nseErr) {
+            quote = await yahooFinance.quote(`${symbol}.BO`);
+        }
 
         const currentPrice = quote.regularMarketPrice || quote.regularMarketPreviousClose || 0;
         const previousClose = quote.regularMarketPreviousClose || currentPrice;
         const diff = currentPrice - previousClose;
         const sign = diff >= 0 ? "+" : "";
 
+        // 2. Extract true fundamentals seamlessly
         const mcap = quote.marketCap ? `₹${(quote.marketCap / 10000000).toFixed(2)} Cr` : "N/A";
         const pe = quote.trailingPE ? quote.trailingPE.toFixed(2) : (quote.forwardPE ? quote.forwardPE.toFixed(2) : "N/A");
         const pb = quote.priceToBook ? quote.priceToBook.toFixed(2) : "N/A";
-        const div = quote.dividendYield ? (quote.dividendYield).toFixed(2) + "%" : "0.00%";
+        const divYield = quote.trailingAnnualDividendYield ? (quote.trailingAnnualDividendYield * 100).toFixed(2) + "%" : "0.00%";
         const high52 = quote.fiftyTwoWeekHigh ? `₹${quote.fiftyTwoWeekHigh.toFixed(2)}` : "N/A";
         const low52 = quote.fiftyTwoWeekLow ? `₹${quote.fiftyTwoWeekLow.toFixed(2)}` : "N/A";
 
         return res.json({
-            symbol: req.params.symbol.toUpperCase(), // Returns requested name so UI matches it
+            symbol: req.params.symbol.toUpperCase(),
             name: quote.longName || quote.shortName || symbol,
             price: currentPrice.toFixed(2),
             changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`,
@@ -97,7 +56,7 @@ app.get('/api/stock/:symbol', async (req, res) => {
             dayLow: quote.regularMarketDayLow ? quote.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2),
             volume: quote.regularMarketVolume ? quote.regularMarketVolume.toLocaleString('en-IN') : "N/A",
             ratios: {
-                marketCap: mcap, peRatio: pe, pbRatio: pb, divYield: div,
+                marketCap: mcap, peRatio: pe, pbRatio: pb, divYield: divYield,
                 fiftyTwoWeekHigh: high52, fiftyTwoWeekLow: low52
             },
             status: "LIVE MARKET DATA"
@@ -105,8 +64,6 @@ app.get('/api/stock/:symbol', async (req, res) => {
 
     } catch (error) {
         console.error(`Error fetching ${symbol}:`, error.message);
-        // CRITICAL FIX: Instead of throwing a 500 error that freezes the UI on "...", 
-        // we return a safe N/A fallback so the rest of the app continues working flawlessly.
         return res.json({
             symbol: req.params.symbol.toUpperCase(), name: symbol, price: "N/A", 
             changeAmount: "N/A", change: "N/A", previousClose: "N/A", status: "FETCH FAILED"
@@ -120,34 +77,40 @@ app.get('/api/history/:symbol', async (req, res) => {
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
 
     try {
-        let result;
+        // Fetch last 3 days to guarantee intraday data even right after weekends
+        const queryOptions = { period1: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000), interval: '5m' }; 
+        let chart;
         try {
-            const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`;
-            const response = await axios.get(url, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie }, timeout: 8000 });
-            result = response.data.chart.result[0];
-        } catch (nseError) {
-            const urlBse = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`;
-            const response = await axios.get(urlBse, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie }, timeout: 8000 });
-            result = response.data.chart.result[0];
+            chart = await yahooFinance.chart(`${symbol}.NS`, queryOptions);
+        } catch (err) {
+            chart = await yahooFinance.chart(`${symbol}.BO`, queryOptions);
         }
-        const timestamps = result.timestamp || [];
-        const quotes = result.indicators.quote[0].close || [];
-        
-        const history = timestamps.map((t, idx) => ({
-            time: new Date(t * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-            price: quotes[idx] ? parseFloat(quotes[idx].toFixed(2)) : null
+
+        const history = (chart.quotes || []).map(q => ({
+            time: new Date(q.date).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
+            price: q.close ? parseFloat(q.close.toFixed(2)) : null
         })).filter(item => item.price !== null);
-        res.json(history);
-    } catch (err) { res.json([]); }
+        
+        // Return only the most recent day's worth of 5-minute ticks (~75 ticks per trading day)
+        res.json(history.slice(-75));
+    } catch (err) { 
+        res.json([]); 
+    }
 });
 
 // --- 3. STOCK NEWS API ---
 app.get('/api/news/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
+    
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=4`, { headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie } });
-        res.json((response.data.news || []).map(n => ({ title: n.title, publisher: n.publisher, link: n.link, time: new Date(n.providerPublishTime * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) })));
+        const news = await yahooFinance.search(symbol, { newsCount: 4, quotesCount: 0 });
+        res.json((news.news || []).map(n => ({ 
+            title: n.title, 
+            publisher: n.publisher, 
+            link: n.link, 
+            time: new Date(n.providerPublishTime).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) 
+        })));
     } catch (err) { res.json([]); }
 });
 
@@ -157,18 +120,18 @@ app.get('/api/search/:query', async (req, res) => {
     const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
     
     try {
-        const response = await axios.get(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=30&newsCount=0`, { 
-            headers: { ...CHROME_HEADERS, 'Cookie': yahooCookie } 
-        });
+        const searchResults = await yahooFinance.search(query, { quotesCount: 30, newsCount: 0 });
         
-        let remote = (response.data.quotes || [])
+        let remote = (searchResults.quotes || [])
             .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
             .map(q => {
                 const cleanSymbol = q.symbol.replace('.NS', '').replace('.BO', '');
                 return { symbol: cleanSymbol, name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)` };
             });
 
-        let uniqueResults = Array.from(new Map(remote.map(item => [item.symbol, item])).values());
+        // Mix in popular local stocks for instant matching
+        const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
+        let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
         
         uniqueResults.sort((a, b) => {
             const aStarts = a.symbol.toLowerCase().startsWith(query);
@@ -177,6 +140,19 @@ app.get('/api/search/:query', async (req, res) => {
             if (!aStarts && bStarts) return 1;
             return 0;
         });
+
+        // Day-1 Listing Verification 
+        if (exactSymbol.length >= 2 && exactSymbol.length <= 15) {
+            const alreadyExists = uniqueResults.some(r => r.symbol === exactSymbol);
+            if (!alreadyExists) {
+                try {
+                    const quote = await yahooFinance.quote(`${exactSymbol}.NS`);
+                    if (quote && quote.regularMarketPrice) {
+                        uniqueResults.unshift({ symbol: exactSymbol, name: quote.longName || quote.shortName || `${exactSymbol} (Newly Listed)`, isNewListing: true });
+                    }
+                } catch (err1) {}
+            }
+        }
         
         res.json(uniqueResults);
     } catch (e) { 
@@ -188,7 +164,10 @@ app.get('/api/search/:query', async (req, res) => {
 app.get('/api/ipos', async (req, res) => {
     try {
         const response = await axios.get('https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/', {
-            headers: CHROME_HEADERS,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml'
+            },
             timeout: 8000
         });
         

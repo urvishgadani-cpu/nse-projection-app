@@ -5,6 +5,7 @@
     "cheerio": "^1.2.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "tough-cookie": "^6.0.2"
+    "tough-cookie": "^6.0.2",
+    "yahoo-finance2": "^4.0.3"
   }
 }

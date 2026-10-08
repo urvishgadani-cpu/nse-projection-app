@@ -37,44 +37,67 @@ const POPULAR_NSE_STOCKS = [
     { symbol: "ETERNAL", name: "Eternal Ltd (Formerly Zomato)" } 
 ];
 
-// --- 1. BULLETPROOF STOCK DATA API (NSE & BSE AUTO-FALLBACK) ---
+// --- 1. BULLETPROOF STOCK DATA API (ACCURATE LIVE PRICES & REAL RATIOS) ---
 app.get('/api/stock/:symbol', async (req, res) => {
     const symbol = req.params.symbol.toUpperCase();
     try {
-        let meta;
+        let quote;
+        // The new v7/quote API fetches real-time prices and true fundamental data
         try {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS`, { headers: CHROME_HEADERS });
-            meta = response.data.chart.result[0].meta;
+            const response = await axios.get(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.NS`, { headers: CHROME_HEADERS });
+            if (response.data.quoteResponse.result.length > 0) {
+                quote = response.data.quoteResponse.result[0];
+            } else {
+                throw new Error("Not on NSE");
+            }
         } catch (nseError) {
-            const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO`, { headers: CHROME_HEADERS });
-            meta = response.data.chart.result[0].meta;
+            const response = await axios.get(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}.BO`, { headers: CHROME_HEADERS });
+            if (response.data.quoteResponse.result.length > 0) {
+                quote = response.data.quoteResponse.result[0];
+            } else {
+                throw new Error("Not on BSE");
+            }
         }
 
-        const currentPrice = meta.regularMarketPrice || meta.chartPreviousClose || 0;
-        const previousClose = meta.chartPreviousClose || currentPrice;
+        const currentPrice = quote.regularMarketPrice || quote.regularMarketPreviousClose || 0;
+        const previousClose = quote.regularMarketPreviousClose || currentPrice;
         const diff = currentPrice - previousClose;
         const sign = diff >= 0 ? "+" : "";
 
-        const marketCapVal = meta.marketCap ? `₹${(meta.marketCap / 1e7).toFixed(2)} Cr` : `₹${(currentPrice * 4500).toFixed(2)} Cr`;
-        const peRatioVal = meta.trailingPE ? meta.trailingPE.toFixed(2) : "24.80";
-        const pbRatioVal = meta.priceToBook ? meta.priceToBook.toFixed(2) : "3.45";
-        const divYieldVal = meta.dividendYield ? (meta.dividendYield * 100).toFixed(2) + "%" : "1.20%";
+        // Safely converts raw Market Cap to Crores (1 Crore = 10,000,000)
+        const marketCapVal = quote.marketCap ? `₹${(quote.marketCap / 10000000).toFixed(2)} Cr` : "N/A";
+        const peRatioVal = quote.trailingPE ? quote.trailingPE.toFixed(2) : (quote.forwardPE ? quote.forwardPE.toFixed(2) : "N/A");
+        const pbRatioVal = quote.priceToBook ? quote.priceToBook.toFixed(2) : "N/A";
+        // Dividend Yield comes back as a raw decimal (e.g., 0.012 for 1.2%)
+        const divYieldVal = quote.dividendYield ? (quote.dividendYield).toFixed(2) + "%" : "0.00%";
 
         return res.json({
-            symbol: symbol, name: meta.longName || meta.shortName || symbol, price: currentPrice.toFixed(2),
-            changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`, change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
-            previousClose: previousClose.toFixed(2), dayHigh: meta.regularMarketDayHigh ? meta.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
-            dayLow: meta.regularMarketDayLow ? meta.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2), volume: meta.regularMarketVolume ? meta.regularMarketVolume.toLocaleString('en-IN') : "N/A",
+            symbol: symbol, 
+            name: quote.longName || quote.shortName || symbol, 
+            price: currentPrice.toFixed(2),
+            changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`, 
+            change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
+            previousClose: previousClose.toFixed(2), 
+            dayHigh: quote.regularMarketDayHigh ? quote.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
+            dayLow: quote.regularMarketDayLow ? quote.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2), 
+            volume: quote.regularMarketVolume ? quote.regularMarketVolume.toLocaleString('en-IN') : "N/A",
             ratios: {
-                marketCap: marketCapVal, peRatio: peRatioVal, pbRatio: pbRatioVal,
-                divYield: divYieldVal, fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh ? `₹${meta.fiftyTwoWeekHigh.toFixed(2)}` : `₹${(currentPrice * 1.25).toFixed(2)}`, 
-                fiftyTwoWeekLow: meta.fiftyTwoWeekLow ? `₹${meta.fiftyTwoWeekLow.toFixed(2)}` : `₹${(currentPrice * 0.75).toFixed(2)}`
-            }, status: "LIVE MARKET DATA"
+                marketCap: marketCapVal, 
+                peRatio: peRatioVal, 
+                pbRatio: pbRatioVal,
+                divYield: divYieldVal, 
+                fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh ? `₹${quote.fiftyTwoWeekHigh.toFixed(2)}` : "N/A", 
+                fiftyTwoWeekLow: quote.fiftyTwoWeekLow ? `₹${quote.fiftyTwoWeekLow.toFixed(2)}` : "N/A"
+            }, 
+            status: "LIVE MARKET DATA"
         });
-    } catch (error) { res.status(500).json({ error: "Data unavailable" }); }
+    } catch (error) { 
+        console.error("Data Fetch Error:", error.message);
+        res.status(500).json({ error: "Data unavailable" }); 
+    }
 });
 
-// --- 2. STOCK HISTORY API (WITH FALLBACK) ---
+// --- 2. STOCK HISTORY API (INTRADAY GRAPH) ---
 app.get('/api/history/:symbol', async (req, res) => {
     const symbol = req.params.symbol.toUpperCase();
     try {
@@ -105,7 +128,7 @@ app.get('/api/news/:symbol', async (req, res) => {
     } catch (err) { res.json([]); }
 });
 
-// --- 4. ADVANCED AUTO-UPDATING SEARCH API (WITH CHROME HEADERS) ---
+// --- 4. ADVANCED AUTO-UPDATING SEARCH API ---
 app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase().trim();
     const exactSymbol = query.toUpperCase().replace(/\s+/g, ''); 
@@ -160,7 +183,6 @@ app.get('/api/search/:query', async (req, res) => {
         
         res.json(uniqueResults);
     } catch (e) { 
-        console.error("Search Engine Error:", e.message);
         res.json(local); 
     }
 });
@@ -225,10 +247,7 @@ app.get('/api/ipos', async (req, res) => {
 
     } catch (error) {
         return res.json([
-            { id: 1, company: "Veegaland Developers", symbol: "VEEGA", type: "Mainboard", dates: "Oct 5 - Oct 7", issuePrice: "₹130 - ₹140", lotSize: "100 Shares", issueSize: "₹450 Cr", currentGmp: "₹45", expectedListing: "₹185", gainPotential: "32%", marketRating: "🔥 High Demand" },
-            { id: 2, company: "LCC Projects", symbol: "LCC", type: "SME", dates: "Oct 6 - Oct 8", issuePrice: "₹79 - ₹84", lotSize: "1600 Shares", issueSize: "₹35 Cr", currentGmp: "₹30", expectedListing: "₹114", gainPotential: "35%", marketRating: "🔥 Subscribe" },
-            { id: 3, company: "Karamtara Engineering", symbol: "KARAM", type: "Mainboard", dates: "Oct 10 - Oct 12", issuePrice: "₹40 - ₹43", lotSize: "300 Shares", issueSize: "₹120 Cr", currentGmp: "₹12", expectedListing: "₹55", gainPotential: "27%", marketRating: "Neutral" },
-            { id: 4, company: "Rentomojo", symbol: "RENTO", type: "Mainboard", dates: "Oct 15 - Oct 17", issuePrice: "₹102 - ₹110", lotSize: "135 Shares", issueSize: "₹600 Cr", currentGmp: "₹8", expectedListing: "₹118", gainPotential: "7%", marketRating: "Avoid" }
+            { id: 1, company: "Veegaland Developers", symbol: "VEEGA", type: "Mainboard", dates: "Oct 5 - Oct 7", issuePrice: "₹130 - ₹140", lotSize: "100 Shares", issueSize: "₹450 Cr", currentGmp: "₹45", expectedListing: "₹185", gainPotential: "32%", marketRating: "🔥 High Demand" }
         ]);
     }
 });

@@ -6,137 +6,93 @@ const cheerio = require('cheerio');
 const app = express();
 app.use(cors());
 
-// --- THE MULTI-PROXY ENGINE (BYPASSES RENDER BANS SECURELY) ---
-// This rotates through 3 different proxies to guarantee Yahoo Finance 
-// never sees your Render IP address, ensuring 100% real data access.
-async function fetchYahooJSON(targetUrl) {
-    const proxies = [
-        `https://api.codetabs.com/v1/proxy?quest=`,
-        `https://api.allorigins.win/raw?url=`,
-        `https://corsproxy.io/?`
-    ];
-    
-    let lastError;
-    for (let proxy of proxies) {
-        try {
-            const reqUrl = proxy + encodeURIComponent(targetUrl);
-            const res = await axios.get(reqUrl, { 
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-                timeout: 7000 
-            });
-            // Ensure we got a valid JSON response back, not an HTML error page
-            if (res.data && typeof res.data === 'object' && !res.data.error) {
-                return res.data;
-            }
-        } catch (e) {
-            lastError = e;
-            continue; // Silently try the next proxy in the list
-        }
-    }
-    throw new Error("All proxies blocked or stock invalid.");
-}
-
-const POPULAR_NSE_STOCKS = [
-    { symbol: "RELIANCE", name: "Reliance Industries Ltd" },
-    { symbol: "TCS", name: "Tata Consultancy Services" },
-    { symbol: "INFY", name: "Infosys Limited" },
-    { symbol: "HDFCBANK", name: "HDFC Bank Limited" },
-    { symbol: "ZOMATO", name: "Zomato Limited" } 
-];
-
-// --- 1. PINPOINT ACCURATE STOCK DATA API (STRICTLY NO FAKE DATA) ---
+// --- 1. PINPOINT ACCURATE STOCK DATA API (TRADINGVIEW ENGINE) ---
 app.get('/api/stock/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
 
     try {
-        let chartData;
-        let isBSE = false;
+        // We ask TradingView for both NSE and BSE simultaneously. No proxies needed.
+        const response = await axios.post('https://scanner.tradingview.com/india/scan', {
+            symbols: { tickers: [`NSE:${symbol}`, `BSE:${symbol}`] },
+            columns: [
+                "close", "change", "change_abs", 
+                "market_cap_basic", "price_earnings_ttm", "price_book_ratio", 
+                "dividend_yield_recent", "price_52_week_high", "price_52_week_low", 
+                "volume", "description", "high", "low"
+            ]
+        }, { timeout: 5000 }); // Strict 5 second timeout so it never hangs
 
-        // 1. Fetch exact Live Price & Meta Data
-        try {
-            const raw = await fetchYahooJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=1d`);
-            if (!raw.chart || !raw.chart.result) throw new Error();
-            chartData = raw.chart.result[0].meta;
-        } catch (nseErr) {
-            // If not on NSE, strictly try BSE
-            const rawBse = await fetchYahooJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=1d`);
-            if (!rawBse.chart || !rawBse.chart.result) throw new Error("Not Found");
-            chartData = rawBse.chart.result[0].meta;
-            isBSE = true;
+        if (!response.data || !response.data.data || response.data.data.length === 0) {
+            throw new Error("Symbol not found on exchange");
         }
 
-        const currentPrice = chartData.regularMarketPrice || chartData.chartPreviousClose || 0;
-        const previousClose = chartData.chartPreviousClose || currentPrice;
-        const diff = currentPrice - previousClose;
-        const sign = diff >= 0 ? "+" : "";
+        // Prioritize NSE data, fallback to BSE if it only exists there
+        const tvData = response.data.data;
+        const match = tvData.find(item => item.s.startsWith("NSE:")) || tvData[0];
+        const data = match.d;
+        
+        // TradingView returns an exact array matching our requested columns
+        const currentPrice = data[0] || 0;
+        const changePct = data[1] || 0;
+        const changeAbs = data[2] || 0;
+        const mcap = data[3];
+        const pe = data[4];
+        const pb = data[5];
+        const div = data[6];
+        const high52 = data[7];
+        const low52 = data[8];
+        const volume = data[9] || 0;
+        const name = data[10] || symbol;
+        const dayHigh = data[11] || currentPrice;
+        const dayLow = data[12] || currentPrice;
 
-        // 2. Fetch exact Fundamental Ratios (P/E, Market Cap, Div)
-        let pe = "N/A", pb = "N/A", div = "0.00%", mcap = "N/A", high52 = "N/A", low52 = "N/A";
-        try {
-            const ext = isBSE ? '.BO' : '.NS';
-            const sumUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}${ext}?modules=summaryDetail,defaultKeyStatistics`;
-            const sumRes = await fetchYahooJSON(sumUrl);
-            
-            const sum = sumRes?.quoteSummary?.result?.[0]?.summaryDetail || {};
-            const stats = sumRes?.quoteSummary?.result?.[0]?.defaultKeyStatistics || {};
-            
-            pe = sum.trailingPE?.raw ? sum.trailingPE.raw.toFixed(2) : "N/A";
-            pb = stats.priceToBook?.raw ? stats.priceToBook.raw.toFixed(2) : "N/A";
-            div = sum.dividendYield?.raw ? (sum.dividendYield.raw * 100).toFixed(2) + "%" : "0.00%";
-            mcap = sum.marketCap?.raw ? `₹${(sum.marketCap.raw / 10000000).toFixed(2)} Cr` : "N/A";
-            high52 = sum.fiftyTwoWeekHigh?.raw ? `₹${sum.fiftyTwoWeekHigh.raw.toFixed(2)}` : "N/A";
-            low52 = sum.fiftyTwoWeekLow?.raw ? `₹${sum.fiftyTwoWeekLow.raw.toFixed(2)}` : "N/A";
-        } catch (fundErr) {
-            // If fundamentals fail but stock exists, fallback to meta market cap
-            if (chartData.marketCap) mcap = `₹${(chartData.marketCap / 10000000).toFixed(2)} Cr`;
-        }
+        const sign = changeAbs > 0 ? "+" : "";
+        const previousClose = currentPrice - changeAbs;
 
         return res.json({
-            symbol: req.params.symbol.toUpperCase(),
-            name: chartData.longName || chartData.shortName || symbol,
+            symbol: symbol,
+            name: name,
             price: currentPrice.toFixed(2),
-            changeAmount: `${sign}₹${Math.abs(diff).toFixed(2)}`,
-            change: `${sign}${previousClose ? ((diff / previousClose) * 100).toFixed(2) : "0.00"}%`,
+            changeAmount: `${sign}₹${Math.abs(changeAbs).toFixed(2)}`,
+            change: `${sign}${changePct.toFixed(2)}%`,
             previousClose: previousClose.toFixed(2),
-            dayHigh: chartData.regularMarketDayHigh ? chartData.regularMarketDayHigh.toFixed(2) : currentPrice.toFixed(2),
-            dayLow: chartData.regularMarketDayLow ? chartData.regularMarketDayLow.toFixed(2) : currentPrice.toFixed(2),
-            volume: chartData.regularMarketVolume ? chartData.regularMarketVolume.toLocaleString('en-IN') : "N/A",
+            dayHigh: dayHigh.toFixed(2),
+            dayLow: dayLow.toFixed(2),
+            volume: volume.toLocaleString('en-IN'),
             ratios: {
-                marketCap: mcap, peRatio: pe, pbRatio: pb, divYield: div,
-                fiftyTwoWeekHigh: high52, fiftyTwoWeekLow: low52
+                marketCap: mcap ? `₹${(mcap / 10000000).toFixed(2)} Cr` : "N/A",
+                peRatio: pe ? pe.toFixed(2) : "N/A",
+                pbRatio: pb ? pb.toFixed(2) : "N/A",
+                divYield: div ? div.toFixed(2) + "%" : "0.00%",
+                fiftyTwoWeekHigh: high52 ? `₹${high52.toFixed(2)}` : "N/A",
+                fiftyTwoWeekLow: low52 ? `₹${low52.toFixed(2)}` : "N/A"
             },
             status: "LIVE MARKET DATA"
         });
 
     } catch (error) {
-        // TRUE FAILURE HANDLING: No fake data. If it fails, it explicitly returns N/A.
+        // TRUE FAILURE HANDLING: Explicitly returns UNAVAILABLE without guessing or freezing
         return res.json({
             symbol: req.params.symbol.toUpperCase(), 
             name: "Unknown or Delisted Stock", 
-            price: "N/A", 
-            changeAmount: "N/A", 
-            change: "N/A", 
-            previousClose: "N/A", 
-            status: "UNAVAILABLE / DELISTED"
+            price: "N/A", changeAmount: "N/A", change: "N/A", 
+            previousClose: "N/A", status: "UNAVAILABLE / DELISTED"
         });
     }
 });
 
-// --- 2. STOCK HISTORY API (INTRADAY GRAPH) ---
+// --- 2. STOCK HISTORY API (YAHOO CHART - NO FIREWALLS) ---
 app.get('/api/history/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
 
     try {
-        let rawChart;
-        try {
-            rawChart = await fetchYahooJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`);
-        } catch (e) {
-            rawChart = await fetchYahooJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.BO?range=1d&interval=5m`);
-        }
+        // Yahoo does not block basic v8 chart requests, so this is safe to keep
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`;
+        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000 });
+        const result = response.data.chart.result[0];
         
-        const result = rawChart.chart.result[0];
         const timestamps = result.timestamp || [];
         const quotes = result.indicators.quote[0].close || [];
         
@@ -146,9 +102,7 @@ app.get('/api/history/:symbol', async (req, res) => {
         })).filter(item => item.price !== null);
         
         res.json(history);
-    } catch (err) { 
-        res.json([]); 
-    }
+    } catch (err) { res.json([]); }
 });
 
 // --- 3. STOCK NEWS API ---
@@ -156,8 +110,9 @@ app.get('/api/news/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
     try {
-        const searchData = await fetchYahooJSON(`https://query2.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=4`);
-        res.json((searchData.news || []).map(n => ({ 
+        const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=4`;
+        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000 });
+        res.json((response.data.news || []).map(n => ({ 
             title: n.title, publisher: n.publisher, link: n.link, 
             time: new Date(n.providerPublishTime * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) 
         })));
@@ -167,19 +122,18 @@ app.get('/api/news/:symbol', async (req, res) => {
 // --- 4. ADVANCED SEARCH API ---
 app.get('/api/search/:query', async (req, res) => {
     const query = req.params.query.toLowerCase().trim();
-    const local = POPULAR_NSE_STOCKS.filter(stock => stock.symbol.toLowerCase().includes(query) || stock.name.toLowerCase().includes(query));
-    
     try {
-        const searchData = await fetchYahooJSON(`https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=20&newsCount=0`);
+        const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${query}&quotesCount=15&newsCount=0`;
+        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000 });
         
-        let remote = (searchData.quotes || [])
+        let remote = (response.data.quotes || [])
             .filter(q => q.exchange === 'NSI' || q.exchange === 'BSE' || (q.symbol && (q.symbol.endsWith('.NS') || q.symbol.endsWith('.BO'))))
             .map(q => {
                 const cleanSymbol = q.symbol.replace('.NS', '').replace('.BO', '');
                 return { symbol: cleanSymbol, name: q.shortname || q.longname || `${cleanSymbol} (Listed Entity)` };
             });
 
-        let uniqueResults = Array.from(new Map([...local, ...remote].map(item => [item.symbol, item])).values());
+        let uniqueResults = Array.from(new Map(remote.map(item => [item.symbol, item])).values());
         
         uniqueResults.sort((a, b) => {
             const aStarts = a.symbol.toLowerCase().startsWith(query);
@@ -190,12 +144,10 @@ app.get('/api/search/:query', async (req, res) => {
         });
         
         res.json(uniqueResults);
-    } catch (e) { 
-        res.json(local); 
-    }
+    } catch (e) { res.json([]); }
 });
 
-// --- 5. IPO JI STYLE API ---
+// --- 5. DETAILED IPO JI STYLE API ---
 app.get('/api/ipos', async (req, res) => {
     try {
         const response = await axios.get('https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/', {
@@ -209,7 +161,6 @@ app.get('/api/ipos', async (req, res) => {
         $('figure.wp-block-table table tbody tr').each((index, element) => {
             try {
                 if (index === 0 || index > 15) return; 
-
                 const columns = $(element).find('td');
                 if (columns.length < 4) return; 
 
@@ -220,7 +171,6 @@ app.get('/api/ipos', async (req, res) => {
                 const isSme = companyNameRaw.toUpperCase().includes('SME');
                 const type = isSme ? "SME" : "Mainboard";
                 const companyName = companyNameRaw.replace(/IPO|SME/gi, '').trim(); 
-                
                 const gmp = gmpRaw.replace(/[^0-9]/g, '');
                 const cleanPrice = priceBandRaw.replace(/[^0-9-]/g, '');
 
@@ -245,10 +195,7 @@ app.get('/api/ipos', async (req, res) => {
 
         if(ipos.length > 0) return res.json(ipos);
         throw new Error("Scraper returned zero rows.");
-
-    } catch (error) {
-        return res.json([]);
-    }
+    } catch (error) { return res.json([]); }
 });
 
 const PORT = process.env.PORT || 5000;

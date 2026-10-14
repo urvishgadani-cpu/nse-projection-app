@@ -12,7 +12,6 @@ app.get('/api/stock/:symbol', async (req, res) => {
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
 
     try {
-        // We ask TradingView for both NSE and BSE simultaneously. No proxies needed.
         const response = await axios.post('https://scanner.tradingview.com/india/scan', {
             symbols: { tickers: [`NSE:${symbol}`, `BSE:${symbol}`] },
             columns: [
@@ -21,18 +20,16 @@ app.get('/api/stock/:symbol', async (req, res) => {
                 "dividend_yield_recent", "price_52_week_high", "price_52_week_low", 
                 "volume", "description", "high", "low"
             ]
-        }, { timeout: 5000 }); // Strict 5 second timeout so it never hangs
+        }, { timeout: 5000 }); 
 
         if (!response.data || !response.data.data || response.data.data.length === 0) {
             throw new Error("Symbol not found on exchange");
         }
 
-        // Prioritize NSE data, fallback to BSE if it only exists there
         const tvData = response.data.data;
         const match = tvData.find(item => item.s.startsWith("NSE:")) || tvData[0];
         const data = match.d;
         
-        // TradingView returns an exact array matching our requested columns
         const currentPrice = data[0] || 0;
         const changePct = data[1] || 0;
         const changeAbs = data[2] || 0;
@@ -72,7 +69,6 @@ app.get('/api/stock/:symbol', async (req, res) => {
         });
 
     } catch (error) {
-        // TRUE FAILURE HANDLING: Explicitly returns UNAVAILABLE without guessing or freezing
         return res.json({
             symbol: req.params.symbol.toUpperCase(), 
             name: "Unknown or Delisted Stock", 
@@ -82,13 +78,12 @@ app.get('/api/stock/:symbol', async (req, res) => {
     }
 });
 
-// --- 2. STOCK HISTORY API (YAHOO CHART - NO FIREWALLS) ---
+// --- 2. STOCK HISTORY API ---
 app.get('/api/history/:symbol', async (req, res) => {
     let symbol = req.params.symbol.toUpperCase();
     if (symbol === 'ETERNAL') symbol = 'ZOMATO';
 
     try {
-        // Yahoo does not block basic v8 chart requests, so this is safe to keep
         const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?range=1d&interval=5m`;
         const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000 });
         const result = response.data.chart.result[0];
@@ -158,20 +153,30 @@ app.get('/api/ipos', async (req, res) => {
         const $ = cheerio.load(response.data);
         const ipos = [];
 
-        $('figure.wp-block-table table tbody tr').each((index, element) => {
+        // FIX: Ultra-forgiving selector that scans all tables and filters dynamically
+        $('table tr').each((index, element) => {
             try {
-                if (index === 0 || index > 15) return; 
-                const columns = $(element).find('td');
-                if (columns.length < 4) return; 
+                if (ipos.length >= 15) return; // Limit to 15 IPOs to prevent parsing footer tables
 
-                const companyNameRaw = $(columns[0]).text() || "";
-                const gmpRaw = $(columns[1]).text() || "0";
-                const priceBandRaw = $(columns[3]).text() || "0"; 
+                const columns = $(element).find('td');
+                if (columns.length < 4) return; // Skip headers (th) or empty rows
+
+                const companyNameRaw = $(columns[0]).text().trim();
+                const gmpRaw = $(columns[1]).text().trim();
+                const col2 = $(columns[2]).text().trim();
+                const col3 = $(columns[3]).text().trim();
+                
+                // Skip if this row is actually a header row pretending to be data
+                if (companyNameRaw.toLowerCase().includes('ipo name') || companyNameRaw.toLowerCase().includes('company')) return;
+
+                // FIX: Column Shifting Protection (Price is sometimes in col 2, sometimes col 3)
+                const priceBandRaw = (/\d/.test(col2)) ? col2 : col3;
                 
                 const isSme = companyNameRaw.toUpperCase().includes('SME');
                 const type = isSme ? "SME" : "Mainboard";
                 const companyName = companyNameRaw.replace(/IPO|SME/gi, '').trim(); 
-                const gmp = gmpRaw.replace(/[^0-9]/g, '');
+                
+                const gmp = gmpRaw.replace(/[^0-9]/g, '') || "0";
                 const cleanPrice = priceBandRaw.replace(/[^0-9-]/g, '');
 
                 if (companyName && companyName.length > 2) {
@@ -182,20 +187,31 @@ app.get('/api/ipos', async (req, res) => {
                     const gainPct = parsedPrice > 0 ? Math.round((parsedGmp / parsedPrice) * 100) : 0;
 
                     ipos.push({
-                        id: index, company: companyName, symbol: companyName.substring(0, 8).toUpperCase(),
-                        type: type, dates: "Upcoming", issuePrice: cleanPrice ? `₹${cleanPrice}` : "N/A",
-                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares", issueSize: "TBA",
+                        id: index, 
+                        company: companyName, 
+                        symbol: companyName.substring(0, 8).toUpperCase(),
+                        type: type, 
+                        dates: "Upcoming / Active", 
+                        issuePrice: parsedPrice > 0 ? `₹${parsedPrice}` : "TBA",
+                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares", 
+                        issueSize: "TBA",
                         currentGmp: parsedGmp > 0 ? `₹${parsedGmp}` : "₹0",
                         expectedListing: expListing > 0 ? `₹${expListing}` : "TBD",
-                        gainPotential: `${gainPct}%`, marketRating: parsedGmp > 30 ? "🔥 Subscribe" : "Neutral"
+                        gainPotential: `${gainPct}%`, 
+                        marketRating: parsedGmp > 30 ? "🔥 Subscribe" : "Neutral"
                     });
                 }
-            } catch (rowError) { }
+            } catch (rowError) { 
+                // Ignore silent parsing errors on individual weird rows
+            }
         });
 
         if(ipos.length > 0) return res.json(ipos);
         throw new Error("Scraper returned zero rows.");
-    } catch (error) { return res.json([]); }
+    } catch (error) { 
+        console.error("IPO Scraper Error:", error.message);
+        return res.json([]); 
+    }
 });
 
 const PORT = process.env.PORT || 5000;

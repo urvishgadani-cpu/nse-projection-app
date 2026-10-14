@@ -13,7 +13,6 @@ export default function Dashboard() {
     
     const [selectedStock, setSelectedStock] = useState(null);
     
-    // Use a ref to always track the latest selected stock without breaking useEffect triggers
     const selectedStockRef = useRef(selectedStock);
     useEffect(() => {
         selectedStockRef.current = selectedStock;
@@ -21,48 +20,71 @@ export default function Dashboard() {
 
     const [stockHistory, setStockHistory] = useState([]);
     const [stockNews, setStockNews] = useState([]);
-    const [watchlist, setWatchlist] = useState([]);
+    
+    const [watchlist, setWatchlist] = useState([]); 
+    const [liveWatchlist, setLiveWatchlist] = useState([]); 
+
     const [ipos, setIpos] = useState([]);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [years, setYears] = useState(3);
     const [expectedGrowth, setExpectedGrowth] = useState(12);
 
     const db = getDatabase(); 
-    const [nseStocks, setNseStocks] = useState([
-        { symbol: "RELIANCE", name: "Reliance Industries Ltd", price: "...", change: "...", status: "FETCHING" },
-        { symbol: "TCS", name: "Tata Consultancy Services", price: "...", change: "...", status: "FETCHING" },
-        { symbol: "INFY", name: "Infosys Limited", price: "...", change: "...", status: "FETCHING" },
-        { symbol: "ETERNAL", name: "Eternal Ltd (Formerly Zomato)", price: "...", change: "...", status: "FETCHING" }
-    ]);
 
-    // Background Refresher (Updates core grid without stealing user focus)
+    useEffect(() => {
+        if (currentUser) return onValue(ref(db, `watchlists/${currentUser.uid}`), (snapshot) => setWatchlist(snapshot.val() || []));
+    }, [currentUser, db]);
+
+    // FIXED: Isolated API calls with try/catch to prevent cascading failures
     const loadRealMarketData = async () => {
         setIsRefreshing(true);
-        const updatedData = await Promise.all(nseStocks.map(s => fetchStockData(s.symbol)));
         
-        setNseStocks(prev => prev.map(stock => updatedData.find(d => d && d.symbol === stock.symbol) || stock));
-
-        // Safely update selected stock prices in the background *only if* the user is actively viewing one
-        if (selectedStockRef.current) {
-            const freshActive = updatedData.find(d => d && d.symbol === selectedStockRef.current.symbol);
-            if (freshActive) {
-                setSelectedStock(prev => ({ ...prev, ...freshActive }));
+        // 1. Fetch Watchlist
+        try {
+            if (watchlist.length > 0) {
+                const updatedData = await Promise.all(watchlist.map(s => fetchStockData(s.symbol)));
+                setLiveWatchlist(watchlist.map(stock => {
+                    const fresh = updatedData.find(d => d && d.symbol === stock.symbol);
+                    return fresh ? { ...stock, ...fresh } : { ...stock, price: "...", change: "...", status: "FETCHING" };
+                }));
+            } else {
+                setLiveWatchlist([]);
             }
+        } catch (error) {
+            console.error("Failed to fetch watchlist:", error);
         }
 
-        const ipoData = await fetchIpoData();
-        setIpos(ipoData);
-        setIsRefreshing(false);
+        // 2. Fetch Selected Stock
+        try {
+            if (selectedStockRef.current) {
+                const freshActive = await fetchStockData(selectedStockRef.current.symbol);
+                if (freshActive) {
+                    setSelectedStock(prev => ({ ...prev, ...freshActive }));
+                }
+            }
+        } catch (error) {
+            console.error("Failed to fetch active stock:", error);
+        }
+
+        // 3. Fetch IPOs (Protected from other failures)
+        try {
+            const ipoData = await fetchIpoData();
+            // Ensure it's an array to prevent mapping errors
+            setIpos(Array.isArray(ipoData) ? ipoData : []);
+        } catch (error) {
+            console.error("Failed to fetch IPOs:", error);
+            setIpos([]);
+        } finally {
+            setIsRefreshing(false);
+        }
     };
 
-    // Global Grid Poll (Every 60s)
     useEffect(() => {
         loadRealMarketData();
         const interval = setInterval(loadRealMarketData, 60000); 
         return () => clearInterval(interval);
-    }, []);
+    }, [watchlist]); 
 
-    // Dedicated effect for when the user explicitly clicks a new stock
     useEffect(() => {
         if (selectedStock && selectedStock.symbol) {
             fetchStockHistory(selectedStock.symbol).then(setStockHistory);
@@ -71,12 +93,8 @@ export default function Dashboard() {
     }, [selectedStock?.symbol]);
 
     useEffect(() => {
-        if (currentUser) return onValue(ref(db, `watchlists/${currentUser.uid}`), (snapshot) => setWatchlist(snapshot.val() || []));
-    }, [currentUser, db]);
-
-    useEffect(() => {
         const delaySearch = setTimeout(async () => {
-            if (searchTerm.trim().length > 1) {
+            if (searchTerm.trim().length > 0) {
                 setIsSearching(true); setSearchResults(await searchStocks(searchTerm)); setIsSearching(false);
             } else setSearchResults([]);
         }, 300);
@@ -94,10 +112,10 @@ export default function Dashboard() {
     const toggleWatchlist = () => {
         if (!selectedStock || !currentUser) return;
         const isSaved = watchlist.some(s => s.symbol === selectedStock.symbol);
-        set(ref(db, `watchlists/${currentUser.uid}`), isSaved ? watchlist.filter(s => s.symbol !== selectedStock.symbol) : [...watchlist, selectedStock]);
+        const cleanStock = { symbol: selectedStock.symbol, name: selectedStock.name };
+        set(ref(db, `watchlists/${currentUser.uid}`), isSaved ? watchlist.filter(s => s.symbol !== selectedStock.symbol) : [...watchlist, cleanStock]);
     };
 
-    // --- GRAPH CALCULATIONS ---
     const currentVal = selectedStock && !isNaN(parseFloat(selectedStock.price)) ? parseFloat(selectedStock.price) : 0;
     const prevClose = selectedStock && !isNaN(parseFloat(selectedStock.previousClose)) ? parseFloat(selectedStock.previousClose) : 0;
     const histPrices = stockHistory.map(h => h.price);
@@ -114,7 +132,7 @@ export default function Dashboard() {
     const histPoints = stockHistory.map((h, idx) => {
         const x = marginLeft + (idx / (stockHistory.length - 1 || 1)) * (chartWidth - marginLeft);
         const y = chartHeight - ((h.price - minHist) / (maxHist - minHist || 1)) * chartHeight;
-        return `${x},${y}`;
+        return x + "," + y;
     }).join(' ');
 
     const yTicks = [0, 0.25, 0.5, 0.75, 1].map(ratio => {
@@ -125,7 +143,12 @@ export default function Dashboard() {
     const projChartData = Array.from({ length: years + 1 }, (_, i) => parseFloat((currentVal * Math.pow(1 + expectedGrowth / 100, i)).toFixed(2)));
     const maxProj = Math.max(...projChartData, currentVal * 1.1);
     const minProj = Math.min(...projChartData, currentVal * 0.9);
-    const projPoints = projChartData.map((val, idx) => `${(idx / (years || 1)) * chartWidth},${chartHeight - ((val - minProj) / (maxProj - minProj || 1)) * chartHeight}`).join(' ');
+    
+    const projPoints = projChartData.map((val, idx) => {
+        const x = (idx / (years || 1)) * chartWidth;
+        const y = chartHeight - ((val - minProj) / (maxProj - minProj || 1)) * chartHeight;
+        return x + "," + y;
+    }).join(' ');
 
     return (
         <div style={{ padding: "40px", fontFamily: "sans-serif", maxWidth: "1000px", margin: "0 auto", color: "white" }}>
@@ -134,63 +157,138 @@ export default function Dashboard() {
                 <div>
                     <h2>NSE Market Dashboard</h2>
                     <div style={{ display: "flex", alignItems: "center", gap: "12px", fontSize: "12px" }}>
-                        <span style={{ color: "#4ade80", display: "flex", alignItems: "center", gap: "5px" }}><span style={{ height: "8px", width: "8px", backgroundColor: "#4ade80", borderRadius: "50%", display: "inline-block" }}></span> Live Data Connected</span>
+                        <span style={{ color: "#4ade80", display: "flex", alignItems: "center", gap: "5px" }}>
+                            <span style={{ height: "8px", width: "8px", backgroundColor: "#4ade80", borderRadius: "50%", display: "inline-block" }}></span> 
+                            Live Data Connected
+                        </span>
                     </div>
                 </div>
                 <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-                    <button onClick={() => setActiveTab('stocks')} style={{ padding: "8px 14px", backgroundColor: activeTab === 'stocks' ? "#38bdf8" : "#1e293b", color: activeTab === 'stocks' ? "#0f172a" : "white", border: "1px solid #475569", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>Stocks & Analysis</button>
-                    <button onClick={() => setActiveTab('ipos')} style={{ padding: "8px 14px", backgroundColor: activeTab === 'ipos' ? "#38bdf8" : "#1e293b", color: activeTab === 'ipos' ? "#0f172a" : "white", border: "1px solid #475569", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>🚀 Active IPO Tracker</button>
-                    <button onClick={loadRealMarketData} disabled={isRefreshing} style={{ padding: "8px 14px", backgroundColor: "#334155", color: "white", border: "1px solid #475569", borderRadius: "6px", cursor: "pointer" }}>🔄</button>
-                    <button onClick={() => signOut(getAuth())} style={{ padding: "8px 12px", backgroundColor: "#ef4444", color: "white", border: "none", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>Sign Out</button>
+                    <button 
+                        onClick={() => setActiveTab('stocks')} 
+                        style={{ padding: "8px 14px", backgroundColor: activeTab === 'stocks' ? "#38bdf8" : "#1e293b", color: activeTab === 'stocks' ? "#0f172a" : "white", border: "1px solid #475569", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>
+                        Stocks & Analysis
+                    </button>
+                    <button 
+                        onClick={() => setActiveTab('ipos')} 
+                        style={{ padding: "8px 14px", backgroundColor: activeTab === 'ipos' ? "#38bdf8" : "#1e293b", color: activeTab === 'ipos' ? "#0f172a" : "white", border: "1px solid #475569", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>
+                        🚀 Active IPO Tracker
+                    </button>
+                    <button 
+                        onClick={() => loadRealMarketData()} 
+                        disabled={isRefreshing} 
+                        style={{ padding: "8px 14px", backgroundColor: "#334155", color: "white", border: "1px solid #475569", borderRadius: "6px", cursor: "pointer" }}>
+                        {isRefreshing ? '⏳' : '🔄'}
+                    </button>
+                    <button 
+                        onClick={() => signOut(getAuth())} 
+                        style={{ padding: "8px 12px", backgroundColor: "#ef4444", color: "white", border: "none", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>
+                        Sign Out
+                    </button>
                 </div>
             </div>
 
             {activeTab === 'stocks' && (
                 <>
                     <div style={{ marginBottom: "30px", position: "relative" }}>
-                        <input type="text" placeholder="Search ANY NSE stock to inspect (e.g. ETERNAL, TATAMOTORS)..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} style={{ width: "100%", padding: "14px", backgroundColor: "#1e293b", color: "white", border: "1px solid #475569", borderRadius: "8px", fontSize: "16px", outline: "none", boxSizing: "border-box" }} />
+                        <input 
+                            type="text" 
+                            placeholder="Search 5000+ live NSE/BSE stocks & newly listed companies (e.g., RBA, ETERNAL)..." 
+                            value={searchTerm} 
+                            onChange={(e) => setSearchTerm(e.target.value)} 
+                            style={{ width: "100%", padding: "14px", backgroundColor: "#1e293b", color: "white", border: "1px solid #475569", borderRadius: "8px", fontSize: "16px", outline: "none", boxSizing: "border-box" }} 
+                        />
                         {(searchResults.length > 0 || isSearching) && (
-                            <div style={{ position: "absolute", top: "100%", left: 0, right: 0, backgroundColor: "#0f172a", border: "1px solid #38bdf8", borderRadius: "8px", marginTop: "5px", zIndex: 10, maxHeight: "300px", overflowY: "auto" }}>
-                                {isSearching ? <div style={{ padding: "15px", color: "#94a3b8", textAlign: "center" }}>Searching NSE...</div> : searchResults.map((res, idx) => (
-                                    <div key={idx} onClick={() => handleSelectSearchResult(res)} style={{ padding: "15px", borderBottom: "1px solid #1e293b", cursor: "pointer" }}>
-                                        <span style={{ fontWeight: "bold", color: "#38bdf8", marginRight: "10px" }}>{res.symbol}</span><span style={{ color: "#94a3b8" }}>{res.name}</span>
-                                    </div>
-                                ))}
+                            <div style={{ position: "absolute", top: "100%", left: 0, right: 0, backgroundColor: "#0f172a", border: "1px solid #38bdf8", borderRadius: "8px", marginTop: "5px", zIndex: 10, maxHeight: "350px", overflowY: "auto", boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.5)" }}>
+                                {isSearching ? (
+                                    <div style={{ padding: "15px", color: "#94a3b8", textAlign: "center" }}>Searching live market databases...</div>
+                                ) : (
+                                    searchResults.map((res, idx) => (
+                                        <div 
+                                            key={idx} 
+                                            onClick={() => handleSelectSearchResult(res)} 
+                                            style={{ padding: "15px", borderBottom: "1px solid #1e293b", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", transition: "0.2s" }} 
+                                            onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#1e293b'} 
+                                            onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                                        >
+                                            <div>
+                                                <span style={{ fontWeight: "bold", color: "#38bdf8", marginRight: "10px" }}>{res.symbol}</span>
+                                                <span style={{ color: "#94a3b8" }}>{res.name}</span>
+                                            </div>
+                                            {res.isNewListing && (
+                                                <span style={{ fontSize: "11px", backgroundColor: "rgba(74, 222, 128, 0.15)", color: "#4ade80", padding: "4px 8px", borderRadius: "6px", border: "1px solid #4ade80", fontWeight: "bold", whiteSpace: "nowrap", marginLeft: "10px" }}>
+                                                    🔥 Newly Listed
+                                                </span>
+                                            )}
+                                        </div>
+                                    ))
+                                )}
                             </div>
                         )}
                     </div>
 
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "20px" }}>
-                        {nseStocks.map((stock) => (
-                            <div key={stock.symbol} onClick={() => setSelectedStock(stock)} style={{ padding: "20px", backgroundColor: "#1e293b", border: selectedStock?.symbol === stock.symbol ? "2px solid #38bdf8" : "1px solid #334155", borderRadius: "10px", cursor: "pointer" }}>
-                                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <h3 style={{ margin: "0 0 2px 0", color: "#38bdf8" }}>{stock.symbol}</h3>
-                                    <span style={{ color: String(stock.change).startsWith("+") ? "#4ade80" : "#f87171", fontSize: "14px", fontWeight: "bold" }}>{stock.change}</span>
+                        {liveWatchlist.length > 0 ? (
+                            liveWatchlist.map((stock) => (
+                                <div 
+                                    key={stock.symbol} 
+                                    onClick={() => setSelectedStock(stock)} 
+                                    style={{ padding: "20px", backgroundColor: "#1e293b", border: selectedStock?.symbol === stock.symbol ? "2px solid #38bdf8" : "1px solid #334155", borderRadius: "10px", cursor: "pointer" }}
+                                >
+                                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                                        <h3 style={{ margin: "0 0 2px 0", color: "#38bdf8" }}>{stock.symbol}</h3>
+                                        <span style={{ color: String(stock.change).startsWith("+") ? "#4ade80" : "#f87171", fontSize: "14px", fontWeight: "bold" }}>{stock.change}</span>
+                                    </div>
+                                    <p style={{ margin: "10px 0 15px 0", fontSize: "13px", color: "#94a3b8", height: "32px", overflow: "hidden" }}>{stock.name}</p>
+                                    <p style={{ margin: "0", fontWeight: "bold", fontSize: "22px" }}>₹{stock.price}</p>
                                 </div>
-                                <p style={{ margin: "10px 0 15px 0", fontSize: "13px", color: "#94a3b8", height: "32px", overflow: "hidden" }}>{stock.name}</p>
-                                <p style={{ margin: "0", fontWeight: "bold", fontSize: "22px" }}>₹{stock.price}</p>
+                            ))
+                        ) : (
+                            <div style={{ gridColumn: "1 / -1", padding: "30px", textAlign: "center", border: "1px dashed #475569", borderRadius: "10px", color: "#94a3b8" }}>
+                                Your watchlist is currently empty. <br/><br/> Use the search bar above to find a stock and click <strong>⭐ Save Watchlist</strong> to add it to your dashboard.
                             </div>
-                        ))}
+                        )}
                     </div>
 
                     {selectedStock && (
                         <div style={{ marginTop: "40px", padding: "25px", backgroundColor: "#1e293b", border: "1px solid #38bdf8", borderRadius: "10px" }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "25px" }}>
                                 <div>
-                                    <h3 style={{ margin: "0", color: "#38bdf8" }}>{selectedStock.name} ({selectedStock.symbol})</h3>
-                                    <span style={{ fontSize: "12px", color: "#94a3b8" }}>Status: {selectedStock.status}</span>
+                                    <h3 style={{ margin: "0", color: "#38bdf8", fontSize: "26px" }}>
+                                        {selectedStock.name} <span style={{ fontSize: "16px", color: "#94a3b8" }}>({selectedStock.symbol})</span>
+                                    </h3>
+                                    
+                                    <div style={{ display: "flex", alignItems: "baseline", gap: "15px", marginTop: "12px" }}>
+                                        <span style={{ fontSize: "36px", fontWeight: "bold", color: "#f8fafc" }}>
+                                            ₹{selectedStock.price || "..."}
+                                        </span>
+                                        {selectedStock.changeAmount && (
+                                            <span style={{ fontSize: "18px", fontWeight: "bold", color: String(selectedStock.change).startsWith("+") ? "#4ade80" : "#f87171" }}>
+                                                {selectedStock.changeAmount} ({selectedStock.change})
+                                            </span>
+                                        )}
+                                    </div>
+
+                                    <span style={{ fontSize: "12px", color: "#94a3b8", display: "block", marginTop: "8px" }}>Status: {selectedStock.status}</span>
                                 </div>
                                 <div style={{ display: "flex", gap: "10px" }}>
-                                    <a href={`https://www.screener.in/company/${selectedStock.symbol}/consolidated/#documents`} target="_blank" rel="noreferrer" style={{ padding: "8px 12px", backgroundColor: "#38bdf8", color: "#0f172a", textDecoration: "none", borderRadius: "6px", fontWeight: "bold", fontSize: "14px" }}>
-                                        📄 Annual Reports (Screener)
+                                    <a 
+                                        href={`https://www.screener.in/company/${selectedStock.symbol}/consolidated/#documents`} 
+                                        target="_blank" 
+                                        rel="noreferrer" 
+                                        style={{ padding: "8px 12px", backgroundColor: "#38bdf8", color: "#0f172a", textDecoration: "none", borderRadius: "6px", fontWeight: "bold", fontSize: "14px" }}
+                                    >
+                                        📄 Annual Reports
                                     </a>
-                                    <button onClick={toggleWatchlist} style={{ padding: "8px 12px", backgroundColor: watchlist.some(s => s.symbol === selectedStock.symbol) ? "#ef4444" : "#eab308", color: "white", border: "none", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}>
+                                    <button 
+                                        onClick={toggleWatchlist} 
+                                        style={{ padding: "8px 12px", backgroundColor: watchlist.some(s => s.symbol === selectedStock.symbol) ? "#ef4444" : "#eab308", color: "white", border: "none", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}
+                                    >
                                         {watchlist.some(s => s.symbol === selectedStock.symbol) ? "❌ Remove Watchlist" : "⭐ Save Watchlist"}
                                     </button>
                                 </div>
                             </div>
 
-                            {/* Financials & Key Ratios */}
                             {selectedStock.ratios && (
                                 <div style={{ padding: "20px", backgroundColor: "#0f172a", borderRadius: "8px", border: "1px solid #334155", marginBottom: "25px" }}>
                                     <h4 style={{ margin: "0 0 15px 0", color: "#38bdf8" }}>📊 Key Ratios & Valuation</h4>
@@ -205,19 +303,17 @@ export default function Dashboard() {
                                 </div>
                             )}
 
-                            {/* Intraday Market Graph */}
                             <div style={{ padding: "20px", backgroundColor: "#1c1c1c", borderRadius: "8px", border: "1px solid #333", marginBottom: "25px" }}>
                                 <div style={{ position: "relative" }}>
                                     {stockHistory.length > 0 ? (
                                         <>
-                                            <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} style={{ width: "100%", height: "200px", overflow: "visible" }}>
+                                            <svg viewBox={"0 0 " + chartWidth + " " + chartHeight} style={{ width: "100%", height: "200px", overflow: "visible" }}>
                                                 {yTicks.map((tick, i) => (
                                                     <g key={i}>
                                                         <text x="0" y={tick.y + 4} fill="#64748b" fontSize="12px">{tick.val}</text>
                                                         <line x1={marginLeft} y1={tick.y} x2={chartWidth} y2={tick.y} stroke="#333" strokeDasharray="2 4" />
                                                     </g>
                                                 ))}
-
                                                 <line x1={marginLeft} y1={prevCloseY} x2={chartWidth} y2={prevCloseY} stroke="#94a3b8" strokeDasharray="2 4" strokeWidth="1.5" />
                                                 <text x={chartWidth - 65} y={prevCloseY - 15} fill="#94a3b8" fontSize="11px">Prev close</text>
                                                 <text x={chartWidth - 55} y={prevCloseY - 3} fill="#94a3b8" fontSize="11px">{prevClose.toFixed(2)}</text>
@@ -235,7 +331,6 @@ export default function Dashboard() {
                                 </div>
                             </div>
 
-                            {/* Trust-Backed Pros & Cons Section */}
                             <div style={{ padding: "20px", backgroundColor: "#0f172a", borderRadius: "8px", border: "1px solid #334155", marginBottom: "25px" }}>
                                 <h4 style={{ margin: "0 0 15px 0", color: "#f8fafc" }}>⚖️ Pros & Cons of Investing in {selectedStock.name} (Listed Equity)</h4>
                                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px" }}>
@@ -243,7 +338,7 @@ export default function Dashboard() {
                                         <h5 style={{ color: "#4ade80", margin: "0 0 10px 0" }}>Pros (Advantages)</h5>
                                         <ul style={{ margin: 0, paddingLeft: "20px", fontSize: "13px", color: "#94a3b8", lineHeight: "1.6" }}>
                                             <li><strong>High Liquidity:</strong> Regulated exchanges like the NSE provide continuous markets, allowing investors to buy or sell shares instantly during standard trading hours without being locked into illiquid assets.</li>
-                                            <li><strong>Strict Regulatory Transparency:</strong> Listed entities are bound by SEBI regulations, strictly mandating quarterly financial audits, corporate governance disclosures, and annual reports. (Access real-time reports via the Screener link above).</li>
+                                            <li><strong>Strict Regulatory Transparency:</strong> Listed entities are bound by SEBI regulations, strictly mandating quarterly financial audits, corporate governance disclosures, and annual reports.</li>
                                             <li><strong>Fair Price Discovery:</strong> Prices are driven by transparent, algorithmic exchange order books based on supply and demand, preventing extreme price manipulation frequently seen in unlisted or private grey markets.</li>
                                         </ul>
                                     </div>
@@ -258,13 +353,20 @@ export default function Dashboard() {
                                 </div>
                             </div>
 
-                            {/* Sector News Feed */}
                             <div style={{ padding: "20px", backgroundColor: "#0f172a", borderRadius: "8px", border: "1px solid #334155", marginBottom: "25px" }}>
                                 <h4 style={{ margin: "0 0 15px 0", color: "#f8fafc" }}>📰 Sector & Company News</h4>
                                 {stockNews.length > 0 ? (
                                     <div style={{ display: "grid", gap: "10px" }}>
                                         {stockNews.map((news, idx) => (
-                                            <a key={idx} href={news.link} target="_blank" rel="noreferrer" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px", backgroundColor: "#1e293b", borderRadius: "6px", textDecoration: "none", color: "white", border: "1px solid #334155", transition: "0.2s" }} onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#334155'} onMouseOut={(e) => e.currentTarget.style.backgroundColor = '#1e293b'}>
+                                            <a 
+                                                key={idx} 
+                                                href={news.link} 
+                                                target="_blank" 
+                                                rel="noreferrer" 
+                                                style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px", backgroundColor: "#1e293b", borderRadius: "6px", textDecoration: "none", color: "white", border: "1px solid #334155", transition: "0.2s" }} 
+                                                onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#334155'} 
+                                                onMouseOut={(e) => e.currentTarget.style.backgroundColor = '#1e293b'}
+                                            >
                                                 <span style={{ fontSize: "14px", fontWeight: "bold", color: "#38bdf8" }}>{news.title}</span>
                                                 <span style={{ fontSize: "12px", color: "#94a3b8", marginLeft: "15px", whiteSpace: "nowrap" }}>{news.publisher} ({news.time})</span>
                                             </a>
@@ -275,16 +377,29 @@ export default function Dashboard() {
                                 )}
                             </div>
 
-                            {/* Growth Projection Engine */}
                             <div style={{ padding: "20px", backgroundColor: "#0f172a", borderRadius: "8px", border: "1px solid #334155" }}>
                                 <h4 style={{ margin: "0 0 15px 0", color: "#f8fafc" }}>📊 Interactive Estimation Engine</h4>
                                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", marginBottom: "20px" }}>
-                                    <div><label style={{ fontSize: "13px", color: "#94a3b8" }}>Horizon: {years} Yrs</label><input type="range" min="1" max="10" value={years} onChange={(e) => setYears(Number(e.target.value))} style={{ width: "100%" }} /></div>
-                                    <div><label style={{ fontSize: "13px", color: "#94a3b8" }}>Expected CAGR: {expectedGrowth}%</label><input type="range" min="1" max="30" value={expectedGrowth} onChange={(e) => setExpectedGrowth(Number(e.target.value))} style={{ width: "100%" }} /></div>
+                                    <div>
+                                        <label style={{ fontSize: "13px", color: "#94a3b8" }}>Horizon: {years} Yrs</label>
+                                        <input type="range" min="1" max="10" value={years} onChange={(e) => setYears(Number(e.target.value))} style={{ width: "100%" }} />
+                                    </div>
+                                    <div>
+                                        <label style={{ fontSize: "13px", color: "#94a3b8" }}>Expected CAGR: {expectedGrowth}%</label>
+                                        <input type="range" min="1" max="30" value={expectedGrowth} onChange={(e) => setExpectedGrowth(Number(e.target.value))} style={{ width: "100%" }} />
+                                    </div>
                                 </div>
-                                <svg viewBox={`0 0 ${chartWidth} 160`} style={{ width: "100%", height: "160px", overflow: "visible" }}>
+                                <svg viewBox={"0 0 " + chartWidth + " 160"} style={{ width: "100%", height: "160px", overflow: "visible" }}>
                                     <polyline fill="none" stroke="#38bdf8" strokeWidth="2.5" points={projPoints} />
-                                    {projChartData.map((val, idx) => <circle key={idx} cx={(idx / (years || 1)) * chartWidth} cy={160 - ((val - minProj) / (maxProj - minProj || 1)) * 160} r="4" fill="#38bdf8" />)}
+                                    {projChartData.map((val, idx) => (
+                                        <circle 
+                                            key={idx} 
+                                            cx={(idx / (years || 1)) * chartWidth} 
+                                            cy={160 - ((val - minProj) / (maxProj - minProj || 1)) * 160} 
+                                            r="4" 
+                                            fill="#38bdf8" 
+                                        />
+                                    ))}
                                 </svg>
                             </div>
                         </div>
@@ -293,18 +408,108 @@ export default function Dashboard() {
             )}
 
             {activeTab === 'ipos' && (
-                <div style={{ backgroundColor: "#1e293b", padding: "25px", borderRadius: "10px", border: "1px solid #38bdf8" }}>
-                    <h3 style={{ color: "#38bdf8", marginTop: 0 }}>🚀 September 2026 Active IPOs</h3>
-                    <div style={{ display: "grid", gap: "15px" }}>
-                        {ipos.map((ipo, idx) => (
-                            <div key={idx} style={{ padding: "18px", backgroundColor: "#0f172a", borderRadius: "8px", border: "1px solid #334155", display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", alignItems: "center", gap: "15px" }}>
-                                <div><h4 style={{ margin: "0 0 4px 0", color: "#f8fafc" }}>{ipo.company}</h4><span style={{ fontSize: "12px", color: "#38bdf8" }}>Sector: {ipo.sector} | Opens: {ipo.openDate}</span></div>
-                                <div><span style={{ fontSize: "11px", color: "#94a3b8" }}>Issue Price</span><p style={{ margin: "2px 0 0 0", fontWeight: "bold" }}>{ipo.issuePrice}</p></div>
-                                <div><span style={{ fontSize: "11px", color: "#94a3b8" }}>GMP (Est.)</span><p style={{ margin: "2px 0 0 0", fontWeight: "bold", color: "#4ade80" }}>{ipo.currentGmp}</p></div>
-                                <div><span style={{ fontSize: "11px", color: "#94a3b8" }}>Exp. Listing</span><p style={{ margin: "2px 0 0 0", fontWeight: "bold", color: "#38bdf8" }}>{ipo.expectedListing} ({ipo.gainPotential})</p></div>
-                                <div style={{ textAlign: "right" }}><span style={{ padding: "4px 8px", backgroundColor: "#1e293b", color: "#eab308", border: "1px solid #eab308", borderRadius: "4px", fontSize: "11px", fontWeight: "bold" }}>{ipo.marketRating}</span></div>
+                <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "25px" }}>
+                        <h3 style={{ color: "#f8fafc", margin: 0, fontSize: "24px", display: "flex", alignItems: "center", gap: "10px" }}>
+                            <span style={{ color: "#38bdf8" }}>🚀</span> Live IPO Dashboard
+                        </h3>
+                        <span style={{ backgroundColor: "rgba(74, 222, 128, 0.1)", color: "#4ade80", border: "1px solid #166534", padding: "6px 12px", borderRadius: "20px", fontSize: "12px", fontWeight: "bold", display: "flex", alignItems: "center", gap: "8px" }}>
+                            <span style={{ width: "8px", height: "8px", backgroundColor: "#4ade80", borderRadius: "50%", display: "inline-block" }}></span> LIVE
+                        </span>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "25px" }}>
+                        {/* FIXED: Added explicit check and fallback UI for empty IPO array */}
+                        {ipos && ipos.length > 0 ? (
+                            ipos.map((ipo, idx) => (
+                                <div 
+                                    key={idx} 
+                                    style={{ backgroundColor: "#1e293b", borderRadius: "12px", border: "1px solid #334155", overflow: "hidden", display: "flex", flexDirection: "column", boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.5)" }}
+                                >
+                                    <div style={{ padding: "20px", borderBottom: "1px solid #334155", backgroundColor: "#0f172a", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                                        <div>
+                                            <h3 style={{ margin: "0 0 5px 0", color: "#f8fafc", fontSize: "18px" }}>{ipo.company}</h3>
+                                            <span style={{ color: "#94a3b8", fontSize: "13px" }}>{ipo.dates}</span>
+                                        </div>
+                                        <span style={{ fontSize: "11px", fontWeight: "bold", padding: "4px 8px", borderRadius: "4px", backgroundColor: ipo.type === 'SME' ? "rgba(168, 85, 247, 0.2)" : "rgba(56, 189, 248, 0.2)", color: ipo.type === 'SME' ? "#c084fc" : "#38bdf8", border: ipo.type === 'SME' ? "1px solid #9333ea" : "1px solid #0284c7" }}>
+                                            {ipo.type || 'Mainboard'}
+                                        </span>
+                                    </div>
+
+                                    <div style={{ padding: "20px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", fontSize: "13px", flexGrow: 1 }}>
+                                        <div>
+                                            <p style={{ margin: "0 0 4px 0", color: "#64748b", textTransform: "uppercase", fontSize: "11px" }}>Issue Price</p>
+                                            <p style={{ margin: 0, color: "#e2e8f0", fontWeight: "bold" }}>{ipo.issuePrice}</p>
+                                        </div>
+                                        <div>
+                                            <p style={{ margin: "0 0 4px 0", color: "#64748b", textTransform: "uppercase", fontSize: "11px" }}>Lot Size</p>
+                                            <p style={{ margin: 0, color: "#e2e8f0", fontWeight: "bold" }}>{ipo.lotSize || 'N/A'}</p>
+                                        </div>
+                                        <div>
+                                            <p style={{ margin: "0 0 4px 0", color: "#64748b", textTransform: "uppercase", fontSize: "11px" }}>Issue Size</p>
+                                            <p style={{ margin: 0, color: "#e2e8f0", fontWeight: "bold" }}>{ipo.issueSize || 'N/A'}</p>
+                                        </div>
+                                        <div>
+                                            <p style={{ margin: "0 0 4px 0", color: "#64748b", textTransform: "uppercase", fontSize: "11px" }}>Expert Rating</p>
+                                            <p style={{ margin: 0, color: ipo.marketRating?.includes('Subscribe') || ipo.marketRating?.includes('High') ? "#fb923c" : "#94a3b8", fontWeight: "bold" }}>{ipo.marketRating}</p>
+                                        </div>
+                                    </div>
+
+                                    <div style={{ padding: "20px", backgroundColor: "#0b1121", borderTop: "1px solid #334155" }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: "12px" }}>
+                                            <div>
+                                                <p style={{ margin: "0 0 4px 0", color: "#64748b", textTransform: "uppercase", fontSize: "11px" }}>Current GMP</p>
+                                                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                                                    <p style={{ margin: 0, fontSize: "24px", fontWeight: "bold", color: ipo.currentGmp === '₹0' ? "#94a3b8" : "#4ade80" }}>
+                                                        {ipo.currentGmp}
+                                                    </p>
+                                                    <span 
+                                                        style={{ 
+                                                            fontSize: "13px", 
+                                                            padding: "4px 8px", 
+                                                            borderRadius: "6px", 
+                                                            fontWeight: "bold", 
+                                                            backgroundColor: parseInt(ipo.gainPotential) > 0 ? "rgba(74, 222, 128, 0.15)" : "rgba(148, 163, 184, 0.15)", 
+                                                            color: parseInt(ipo.gainPotential) > 0 ? "#4ade80" : "#94a3b8" 
+                                                        }}
+                                                    >
+                                                        {parseInt(ipo.gainPotential) > 0 ? '+' : ''}{ipo.gainPotential}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            <div style={{ textAlign: "right" }}>
+                                                <p style={{ margin: "0 0 4px 0", color: "#64748b", textTransform: "uppercase", fontSize: "11px" }}>Est. Listing</p>
+                                                <p style={{ margin: 0, fontSize: "18px", fontWeight: "bold", color: "#f8fafc" }}>
+                                                    {ipo.expectedListing}
+                                                </p>
+                                            </div>
+                                        </div>
+                                        
+                                        <div style={{ width: "100%", height: "6px", backgroundColor: "#1e293b", borderRadius: "3px", overflow: "hidden" }}>
+                                            <div 
+                                                style={{ 
+                                                    height: "100%", 
+                                                    backgroundColor: parseInt(ipo.gainPotential) > 20 ? "#4ade80" : (parseInt(ipo.gainPotential) > 0 ? "#38bdf8" : "#475569"), 
+                                                    width: Math.min(parseInt(ipo.gainPotential) || 0, 100) + "%", 
+                                                    transition: "width 1s ease-in-out" 
+                                                }}
+                                            ></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))
+                        ) : (
+                            <div style={{ gridColumn: "1 / -1", padding: "50px 20px", textAlign: "center", border: "1px dashed #334155", borderRadius: "12px", backgroundColor: "#0f172a" }}>
+                                <p style={{ margin: 0, fontSize: "16px", color: "#94a3b8" }}>
+                                    {isRefreshing ? "⏳ Connecting to live market data..." : "⚠️ No active IPOs found, or the backend connection timed out."}
+                                </p>
+                                {!isRefreshing && (
+                                    <p style={{ margin: "10px 0 0 0", fontSize: "13px", color: "#64748b" }}>
+                                        Ensure your backend is running and the ipowatch.in scraper is returning valid JSON arrays.
+                                    </p>
+                                )}
                             </div>
-                        ))}
+                        )}
                     </div>
                 </div>
             )}

@@ -1,6 +1,8 @@
+const API_BASE_URL = 'https://nse-projection-app.onrender.com';
+
 export async function fetchStockData(symbol) {
     try {
-        const response = await fetch(`http://localhost:5000/api/stock/${symbol}`);
+        const response = await fetch(`${API_BASE_URL}/api/stock/${symbol}`);
         if (!response.ok) throw new Error(`Failed to connect to backend for ${symbol}`);
         return await response.json();
     } catch (error) {
@@ -11,7 +13,7 @@ export async function fetchStockData(symbol) {
 
 export async function fetchStockHistory(symbol) {
     try {
-        const response = await fetch(`http://localhost:5000/api/history/${symbol}`);
+        const response = await fetch(`${API_BASE_URL}/api/history/${symbol}`);
         if (!response.ok) throw new Error("History API failed");
         return await response.json();
     } catch (error) {
@@ -21,7 +23,7 @@ export async function fetchStockHistory(symbol) {
 
 export async function fetchStockNews(symbol) {
     try {
-        const response = await fetch(`http://localhost:5000/api/news/${symbol}`);
+        const response = await fetch(`${API_BASE_URL}/api/news/${symbol}`);
         if (!response.ok) throw new Error("News API failed");
         return await response.json();
     } catch (error) {
@@ -32,7 +34,7 @@ export async function fetchStockNews(symbol) {
 export async function searchStocks(query) {
     try {
         if (!query) return [];
-        const response = await fetch(`http://localhost:5000/api/search/${query}`);
+        const response = await fetch(`${API_BASE_URL}/api/search/${query}`);
         if (!response.ok) throw new Error("Search API failed");
         return await response.json();
     } catch (error) {
@@ -42,7 +44,7 @@ export async function searchStocks(query) {
 
 export async function fetchIpoData() {
     try {
-        const response = await fetch('http://localhost:5000/api/ipos');
+        const response = await fetch(`${API_BASE_URL}/api/ipos`);
         if (!response.ok) throw new Error("IPO API failed");
         return await response.json();
     } catch (error) {

@@ -142,7 +142,7 @@ app.get('/api/search/:query', async (req, res) => {
     } catch (e) { res.json([]); }
 });
 
-// --- 5. DETAILED IPO JI STYLE API ---
+// --- 5. DETAILED IPO JI STYLE API (WITH DEEP SCRAPING) ---
 app.get('/api/ipos', async (req, res) => {
     try {
         const response = await axios.get('https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/', {
@@ -151,25 +151,26 @@ app.get('/api/ipos', async (req, res) => {
         });
         
         const $ = cheerio.load(response.data);
-        const ipos = [];
+        const iposRaw = [];
 
-        // FIX: Ultra-forgiving selector that scans all tables and filters dynamically
+        // 1. Scrape the main table to get the basic info and the DETAIL URL
         $('table tr').each((index, element) => {
             try {
-                if (ipos.length >= 15) return; // Limit to 15 IPOs to prevent parsing footer tables
+                if (iposRaw.length >= 10) return; // Limit to 10 to prevent extreme API timeouts during deep scraping
 
                 const columns = $(element).find('td');
-                if (columns.length < 4) return; // Skip headers (th) or empty rows
+                if (columns.length < 4) return; 
 
-                const companyNameRaw = $(columns[0]).text().trim();
+                const nameCol = $(columns[0]);
+                const companyNameRaw = nameCol.text().trim();
+                const detailUrl = nameCol.find('a').attr('href') || null; // EXPLOIT: Grab the specific company link
+                
                 const gmpRaw = $(columns[1]).text().trim();
                 const col2 = $(columns[2]).text().trim();
                 const col3 = $(columns[3]).text().trim();
                 
-                // Skip if this row is actually a header row pretending to be data
                 if (companyNameRaw.toLowerCase().includes('ipo name') || companyNameRaw.toLowerCase().includes('company')) return;
 
-                // FIX: Column Shifting Protection (Price is sometimes in col 2, sometimes col 3)
                 const priceBandRaw = (/\d/.test(col2)) ? col2 : col3;
                 
                 const isSme = companyNameRaw.toUpperCase().includes('SME');
@@ -186,28 +187,72 @@ app.get('/api/ipos', async (req, res) => {
                     const expListing = parsedPrice + parsedGmp;
                     const gainPct = parsedPrice > 0 ? Math.round((parsedGmp / parsedPrice) * 100) : 0;
 
-                    ipos.push({
+                    iposRaw.push({
                         id: index, 
                         company: companyName, 
                         symbol: companyName.substring(0, 8).toUpperCase(),
                         type: type, 
                         dates: "Upcoming / Active", 
                         issuePrice: parsedPrice > 0 ? `₹${parsedPrice}` : "TBA",
-                        lotSize: isSme ? "1000 - 4000 Shares" : "10 - 100 Shares", 
-                        issueSize: "TBA",
                         currentGmp: parsedGmp > 0 ? `₹${parsedGmp}` : "₹0",
                         expectedListing: expListing > 0 ? `₹${expListing}` : "TBD",
                         gainPotential: `${gainPct}%`, 
-                        marketRating: parsedGmp > 30 ? "🔥 Subscribe" : "Neutral"
+                        marketRating: parsedGmp > 30 ? "🔥 Subscribe" : "Neutral",
+                        detailUrl: detailUrl // Save this for step 2
                     });
                 }
-            } catch (rowError) { 
-                // Ignore silent parsing errors on individual weird rows
-            }
+            } catch (rowError) { }
         });
 
-        if(ipos.length > 0) return res.json(ipos);
-        throw new Error("Scraper returned zero rows.");
+        if(iposRaw.length === 0) throw new Error("Scraper returned zero rows.");
+
+        // 2. DEEP SCRAPING: Visit every single IPO detail page simultaneously to get real lot/issue size
+        const enrichedIpos = await Promise.all(iposRaw.map(async (ipo) => {
+            if (!ipo.detailUrl) {
+                ipo.lotSize = "N/A";
+                ipo.issueSize = "N/A";
+                delete ipo.detailUrl; 
+                return ipo;
+            }
+
+            try {
+                const detailRes = await axios.get(ipo.detailUrl, { 
+                    headers: { 'User-Agent': 'Mozilla/5.0' },
+                    timeout: 6000 // Strict timeout so one broken page doesn't crash the entire dashboard
+                });
+                const $d = cheerio.load(detailRes.data);
+                
+                let foundLotSize = "N/A";
+                let foundIssueSize = "N/A";
+
+                // Scan all tables on the detail page to find the specific rows
+                $d('table tr').each((i, el) => {
+                    const key = $d(el).find('td').eq(0).text().trim().toLowerCase();
+                    const val = $d(el).find('td').eq(1).text().trim();
+
+                    if ((key.includes('lot size') || key.includes('minimum lot')) && foundLotSize === "N/A") {
+                        foundLotSize = val || "N/A";
+                    }
+                    if ((key.includes('issue size') || key.includes('ipo size')) && foundIssueSize === "N/A") {
+                        foundIssueSize = val || "N/A";
+                    }
+                });
+
+                ipo.lotSize = foundLotSize;
+                ipo.issueSize = foundIssueSize;
+                
+            } catch (err) {
+                // If a specific page fails to load, degrade gracefully rather than failing the whole API
+                ipo.lotSize = "Unavailable";
+                ipo.issueSize = "Unavailable";
+            }
+            
+            delete ipo.detailUrl; // Remove the URL before sending to frontend
+            return ipo;
+        }));
+
+        return res.json(enrichedIpos);
+
     } catch (error) { 
         console.error("IPO Scraper Error:", error.message);
         return res.json([]); 
